@@ -65,7 +65,7 @@ c++ 中 string 的結構為:
 
 - 0x0 ~ 0x8: `c_str` pointer，當長度小的時候指向 stack，長度大的時候指向 heap
 - 0x8 ~ 0x10: string length
-- 0x10 ~ 0x18: 根據字串長度，匯市 `c_str` value 或是 string length
+- 0x10 ~ 0x18: 根據字串長度，會是 `c_str` value 或是 string length
 - 0x18 ~ 0x20: garbage
 
 以下為 `malloc_usable_size()` 的 source code:
