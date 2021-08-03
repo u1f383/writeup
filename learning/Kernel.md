@@ -1,4 +1,4 @@
-## Kernel Pwn
+## Kernel
 
 ### Reference
 

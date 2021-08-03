@@ -1307,11 +1307,3 @@ root@ubuntu:~# cat /proc/kallsyms | grep  fixed_percpu_data
 ```
 
 因此 `MSR_GS_BASE == %gs == fixed_percpu_data.gs_base == fixed_percpu_data == 0`。
-
-
-
-
-
-
-
-- Buildroot

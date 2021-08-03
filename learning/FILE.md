@@ -40,7 +40,7 @@ struct _IO_FILE {
   /* 1+column number of pbase(); 0 is unknown. */
   unsigned short _cur_column; // 0x80
   signed char _vtable_offset; // 0x82
-  char _shortbuf[1]; // 0x73
+  char _shortbuf[1]; // 0x83
 
   /*  char* _save_gptr;  char* _save_egptr; */
 
