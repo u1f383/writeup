@@ -230,3 +230,106 @@ JS engine optimize
   - register machine - opcode's inputs and output are using only registers
 - TurboFan  - need to compile those instruction to target architecture
 
+
+
+
+
+#### V8
+
+- `isolate` - 4GB 空間
+- 透過 `Handle` 來幫你改變 pointer，存取 object
+  - [GC](https://v8.dev/blog/trash-talk)
+- `Context` - 建立一個新的執行環境
+  - 不同 JS script 有不同的執行環境
+
+
+
+TurboFan IR
+
+- Graph based
+- operation
+  - JSAdd (JavaScript level)
+  - NumberAdd (Intermediate level (Simplified))
+  - Int32Add (Machine level)
+- high level ---- lowering ----> low level
+- SimplifiedLoweringPhrase
+
+
+
+memory allocation
+
+- small integer (smi, int31) or pointer
+- 若是 pointer，則最後 bit 1
+- `Map` 描述 object 結構
+
+
+
+CVE 2020-16040
+
+- code review 的彭台
+- VisitSpeculativeIntegerAdditiveOp
+  - 將 `Signed32()` 改成 `restriction`
+- Regression test == POC
+- bitwise or `|` 會將兩側當作 int
+
+Lowering
+
+- `propagate`: 從後面 (end) 往前傳遞 tuncation，透過標記新的 type 來截斷不必要的 range
+  - `set_restriction_type`
+- `retype`: 往前 (start) 傳遞更新 type
+  - `RetypeNode()`
+  - `UpdateFeedbackType`
+    - 限制 type (`Signed32()`)
+- `lower`: 將 node lowering 成 machine code
+- CFG 要怎麼 merge 不同的 type
+  - phi --> 代表原本的 type 的其中一個
+- `NaN` 要 bypass 第一階段的 if
+- `y = -1` 要讓我們進去 `DCHECK`
+
+
+
+exploit flow
+
+- oob r/w
+
+- 想辦法建立出長度 -1 的 array:
+  - `array.shift()`
+    - 前幾個月被 patch 了
+    - `new Array(i)`
+    - `arr.shift()`
+    - `TFInlining` -> `TFLoadElimination`
+      - `checksedLen` == `[0,0]`
+      - `range(0,0)`，但實際為 1
+- primitives
+  - addrof / fakeobj
+  - 透過 array + object pointer 來 leak
+  - 為什麼可以改成 pointer ?
+- more power primitives
+  - array 自己控
+  - 任意讀任意寫
+- allocate rwx page
+  - wasm load module，得到 rwx page
+  - how to leak address
+- copy sc
+- jmp sc
+
+
+
+目標為 optimizer 跟 static 分析不一樣
+
+CheckBound elimination
+
+
+
+`isolate` 只會存 offset，只有 32 bit (pointer)
+
+- `ArrayBuffer` 在 V8 中是用 `klloc`，拿到的是 `Isolate` 外的
+- `backing_store`
+
+
+
+`DebugPrint` + `SystemBreak`
+
+array size == -1    ===>    任意寫
+
+gdb `job`
