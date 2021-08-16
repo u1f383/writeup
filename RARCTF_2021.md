@@ -787,6 +787,8 @@ r.interactive()
 - root device - [supersu](https://supersuroot.org/download/)
 - apk decompiler - [jadx](https://github.com/skylot/jadx)
 
+
+
 #### Analyze / Modify apk
 
 拿到 apk 後，可以透過 `apktool d -o <output_dir_name> <file_name>.apk` 取得 apk 內部的檔案 (其實也可以透過 unzip)，基本上目錄結構如下:
