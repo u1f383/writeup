@@ -116,9 +116,17 @@ endif
 
 1. 到 [linux kernel 官方](https://mirrors.edge.kernel.org/pub/linux/kernel/v5.x/) 下載你要的版本的 source code
 2. 解壓縮後執行 `make menuconfig`
-3. 調整你 需要/不要 的設定，並且勾選 `Kernel hacking ---> Kernel debugging & miscellaneous debug code`
+3. 調整你 需要/不要 的設定，並且勾選 `Kernel hacking ---> Kernel debugging`
+   - 每個版本都不一樣 (至少 4 跟 5 有差)
+   - 4 要開啟 `Debug low-level entry code`
+   - 5 要開啟 `miscellaneous debug code`
 4. 執行 `make -j4 ARCH=x86_64` 編譯 kernel
 5. 完成後目錄下會有 `./vmlinux`，這是帶有 debug info 的 linux kenrel；並且在 `./arch/x86/boot/bzImage` 有壓縮過的 linux kernel，是待會 `qemu` 用來執行模擬環境的 kernel
+
+Others
+
+- 編譯時如果需要 bpf，必須 enable network，並且到 `network options` 之類的子菜單勾選需要的功能，如 `enable JIT`
+- 如果要從 patch file 來更新檔案，可以執行 `patch -p<ignore_path> < fn.patch`
 
 
 
@@ -207,6 +215,56 @@ P.S. 也能將指令寫入 `script` 檔，並透過 `gdb ./vmlinux -x script` �
 
 
 參考資料: [kernel pwn 環境建置](https://n0va-scy.github.io/2020/06/21/kernel%20pwn%20%E7%8E%AF%E5%A2%83%E6%90%AD%E5%BB%BA/)
+
+
+
+### Memory layout
+
+From `Documentation/x86/x86_64/mm.txt`:
+
+```
+<previous description obsolete, deleted>
+
+Virtual memory map with 4 level page tables:
+
+0000000000000000 - 00007fffffffffff (=47 bits) user space, different per mm
+hole caused by [48:63] sign extension
+ffff800000000000 - ffff87ffffffffff (=43 bits) guard hole, reserved for hypervisor
+ffff880000000000 - ffffc7ffffffffff (=64 TB) direct mapping of all phys. memory
+ffffc80000000000 - ffffc8ffffffffff (=40 bits) hole
+ffffc90000000000 - ffffe8ffffffffff (=45 bits) vmalloc/ioremap space
+ffffe90000000000 - ffffe9ffffffffff (=40 bits) hole
+ffffea0000000000 - ffffeaffffffffff (=40 bits) virtual memory map (1TB)
+... unused hole ...
+ffffec0000000000 - fffffc0000000000 (=44 bits) kasan shadow memory (16TB)
+... unused hole ...
+ffffff0000000000 - ffffff7fffffffff (=39 bits) %esp fixup stacks
+... unused hole ...
+ffffffef00000000 - ffffffff00000000 (=64 GB) EFI region mapping space
+... unused hole ...
+ffffffff80000000 - ffffffffa0000000 (=512 MB)  kernel text mapping, from phys 0
+ffffffffa0000000 - ffffffffff5fffff (=1526 MB) module mapping space
+ffffffffff600000 - ffffffffffdfffff (=8 MB) vsyscalls
+ffffffffffe00000 - ffffffffffffffff (=2 MB) unused hole
+
+The direct mapping covers all memory in the system up to the highest
+memory address (this means in some cases it can also include PCI memory
+holes).
+
+vmalloc space is lazily synchronized into the different PML4 pages of
+the processes using the page fault handler, with init_level4_pgt as
+reference.
+
+Current X86-64 implementations support up to 46 bits of address space (64 TB),
+which is our current limit. This expands into MBZ space in the page tables.
+
+We map EFI runtime services in the 'efi_pgd' PGD in a 64Gb large virtual
+memory window (this size is arbitrary, it can be raised later if needed).
+The mappings are not part of any other kernel PGD and are only available
+during EFI runtime calls.
+
+-Andi Kleen, Jul 2004
+```
 
 
 
