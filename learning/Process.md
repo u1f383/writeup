@@ -644,3 +644,97 @@ __run_exit_handlers (int status, struct exit_function_list **listp,
 
       - `d == NULL` - 執行所有 registered handler
       - `d == dso_handle`- 執行相同 dso_handle 的 handler
+
+
+
+#### Some helpers
+
+- `LD_SHOW_AUXV=1 ./bin` - 在執行時可以 show auxilary vector
+
+  ```
+  AT_SYSINFO_EHDR:      0x7ffc03fe9000
+  AT_HWCAP:             178bfbff
+  AT_PAGESZ:            4096
+  AT_CLKTCK:            100
+  AT_PHDR:              0x557121a58040
+  AT_PHENT:             56
+  AT_PHNUM:             13
+  AT_BASE:              0x7f7406acc000 // lib base
+  AT_FLAGS:             0x0
+  AT_ENTRY:             0x557121a59040 // entry point
+  AT_UID:               1000
+  AT_EUID:              1000
+  AT_GID:               1000
+  AT_EGID:              1000
+  AT_SECURE:            0
+  AT_RANDOM:            0x7ffc03e983e9
+  AT_HWCAP2:            0x2
+  AT_EXECFN:            ./test
+  AT_PLATFORM:          x86_64
+  ```
+
+- `__gmon_start__` 究竟是幹嘛的? 可以在編譯時加上 `-pg`，執行後會產生 `gmon.out` 的檔案，而後續可以用 `gprof` 的工具來測量效能
+
+- 寫 C source 時若 function 定義 `__attribute__ ((constructor))`，則會在 `__do_global_ctors_aux` 去呼叫該 function 做為 ctor
+
+- 承上，如果 function 定義如 `__attribute__((section(".init_array"))) typeof(init) *__init = my_func;`，則 `my_func` 會被加到 `__libc_csu_init` 執行時 traverse 的 init array 內
+
+參考範例:
+
+```c
+#include <stdio.h>
+
+void preinit(int argc, char **argv, char **envp) {
+ printf("%s\n", __FUNCTION__);
+}
+
+void init(int argc, char **argv, char **envp) {
+ printf("%s\n", __FUNCTION__);
+}
+
+void fini() {
+ printf("%s\n", __FUNCTION__);
+}
+
+__attribute__((section(".init_array"))) typeof(init) *__init = init;
+__attribute__((section(".preinit_array"))) typeof(preinit) *__preinit = preinit;
+__attribute__((section(".fini_array"))) typeof(fini) *__fini = fini;
+
+void  __attribute__ ((constructor)) constructor() {
+ printf("%s\n", __FUNCTION__);
+}
+
+void __attribute__ ((destructor)) destructor() {
+ printf("%s\n", __FUNCTION__);
+}
+
+void my_atexit() {
+ printf("%s\n", __FUNCTION__);
+}
+
+void my_atexit2() {
+ printf("%s\n", __FUNCTION__);
+}
+
+int main() {
+ /* reverse order */
+ atexit(my_atexit);
+ atexit(my_atexit2);
+}
+```
+
+執行結果:
+
+```
+preinit
+constructor
+init
+my_atexit2
+my_atexit
+fini
+destructor
+```
+
+
+
+參考文章: [Linux X86 程序启动 – main函数是如何被执行的？](https://luomuxiaoxiao.com/?p=516)
