@@ -194,3 +194,5 @@ VGA
 bindiff
 
 
+
+`MAP_HUGETLB` - 分配連續記憶體空間
