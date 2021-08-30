@@ -124,7 +124,7 @@ fffc0000-ffffffff : Reserved
 100000000-17fffffff : PCI Bus 0000:00
 ```
 
-這裡除了有一些 IO 的 physical address，也包含 kernel code/rodata/data/bss 的 physical address:
+這裡除了有一些 IO 的 physical address，也包含 kernel code / rodata / data / bss 的 physical address:
 
 ```c
   02600000-03000c36 : Kernel code
@@ -135,7 +135,7 @@ fffc0000-ffffffff : Reserved
 
 當 linux crash 時，可以透過 `kdump` 來搜集 **crash 前**的 memory state 並產生 core dump，而後在透過 `vmcore` 來追蹤原因，而 `/dev/mem` 則是當下的記憶體狀態，並且是直接的 **physical** mapping。
 
-而根據 kernel `Documents/x86/x86_64/mm.txt` 紀錄:
+而根據 kernel `Documentation/x86/x86_64/mm.txt` ([src](https://elixir.bootlin.com/linux/v4.6/source/Documentation/x86/x86_64/mm.txt)) 紀錄:
 
 ```c
 0000000000000000 - 00007fffffffffff (=47 bits) user space, different per mm
@@ -159,13 +159,16 @@ ffffffffff600000 - ffffffffffdfffff (=8 MB) vsyscalls
 ffffffffffe00000 - ffffffffffffffff (=2 MB) unused hole
 ```
 
-可以知道 `0xffff880000000000` ~ `0xffffc7ffffffffff` 也是 direct physical mapping (不過這題是從 `0xffff888000000000`  開始，可以從 panic 的 message 得知)，因此 `0xffff880000000000` 會對應到 physical  `0`，`0xffff880002600000` 會對到 `0x2600000` 也就是 kernel code，同時也能在 `/proc/iomem` 看到相同的位置，以 `gdb` attach qemu-vm 並查看實際的 memory 以及 direct memory mapping 是否擁有相同資料:
+可以知道 `0xffff880000000000` ~ `0xffffc7ffffffffff` 也是 direct physical mapping，不過這題是從 `0xffff888000000000`  開始，可以從 panic 的 message 得知。因此 `0xffff888000000000` 會對應到 physical  `0`，`0xffff888002600000` 會對到 `0x2600000` 也就是 kernel code，同時也能在 `/proc/iomem` 看到相同的位置。
+
+用 `gdb` attach qemu-vm 並查看實際的 memory 以及 direct memory mapping 是否擁有相同資料:
 
 ```c
 (gdb) x/30gx 0xffffffff81000000 (0xffffffff81000000 (text section start))
 0xffffffff81000000:	0x4800e03f51258d48	0xe856fffffff23d8d
 0xffffffff81000010:	0x48106a5e000005cc	0x485000000003058d
 0xffffffff81000020:	0x8d48000000eae8cb	0xfde856ffffffd33d
+    
 (gdb) x/30gx 0xffff888001000000 (0xffff888000000000 + 0x1000000 (iomem kernel code))
 0xffff888001000000:	0x4800e03f51258d48	0xe856fffffff23d8d
 0xffff888001000010:	0x48106a5e000005cc	0x485000000003058d
