@@ -406,3 +406,6 @@ https://gloxec.github.io/2019/04/08/MacOS%20Heap%20Exploit/
 - `process status` - 取得 pid
 - `platform shell vmmap <pid>` - 取得 vmmap
   - 或者 `image list` (比較精簡)
+
+
+
