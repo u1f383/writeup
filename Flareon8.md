@@ -147,7 +147,7 @@ for fn in glob.glob(path):
 
 逆完 binary 後，能知道程式有兩個核心：
 
-1. 輸入的 `name` 以及 `color`，會經過 hash function (CRC32) 產生 hash value，並且比對 table 的當中是否有對應的 `name` 或 `color` 的 hash value，當兩者都與 table 中紀錄的相同，就會回傳一個數字。而此時需要一點靈力，或者是你有觀察到一開始給的壓縮檔中還有其他壓縮檔沒有用到，當回頭解開就能發現裡面 .json 的 metadata 有紀錄人名，嘗試作為 `name` 餵入，就能過第一關的 `name` hash value check。雖然後續會要提供 `color`，但是因為  `name`、`color` 的 hash value 以及數字的資料牌再一起，因此可以直接從 `name` 推得後續取得的 number。
+1. 輸入的 `name` 以及 `color`，會經過 hash function (CRC32) 產生 hash value，並且比對 table 的當中是否有對應的 `name` 或 `color` 的 hash value，當兩者都與 table 中紀錄的相同，就會回傳一個數字。而此時需要一點靈力，或者是你有觀察到一開始給的壓縮檔中還有其他壓縮檔沒有用到，當回頭解開就能發現裡面 .json 的 metadata 有紀錄人名，嘗試作為 `name` 餵入，就能過第一關的 `name` hash value check。雖然後續會要提供 `color`，但是因為  `name`、`color` 的 hash value 以及數字的資料排再一起，因此可以直接從 `name` 推得後續取得的 number。
 2. 載入 `a.dat` ~ `z.dat`，做一些操作後印出，但是在 `.dat` 不正確的情況下印出來的東西是沒意義的
 
 目標很明確，找出正確的 `a.dat` ~ `z.dat`，並在 binary 操作完畢後即可取的 flag，而 `.dat` 也能在各個壓縮檔案中看到，不過有些 layer 只有部分 `.dat`，大概可以猜到不同 layer 可能會提供不同的 `.dat`。
@@ -726,7 +726,7 @@ main dll 並沒有太多的 symbol 可以看，不過動態追蹤 main dll 的�
 
 
 
-在回傳 `flare-on.com` 的情況下，後續的程式會在 `HKEY_CURRENT_USER\Software\Microsoft\Spell\ ` 新增兩個 registry (在此稱為 `r0` and `r1`)，registry `r1` 用 XOR 一個程式內的 const 就能復原，解開後為 `flare-on.com.`；registry `r0` 也是用同樣的方式來 extract，解開後得到 `b3s7_sp3llcheck3r_ev3r`，將兩者組起來後就是 flag 了。不過這邊我是直接動態追 function 在寫入 register 時做了什麼操作，之後就可以推得 flag，所以對 registry 的處理並沒有什麼印象。
+在回傳 `flare-on.com` 的情況下，後續的程式會在 `HKEY_CURRENT_USER\Software\Microsoft\Spell\ ` 新增兩個 registry (在此稱為 `r0` and `r1`)，registry `r1` 用 XOR 一個程式內的 const 就能復原，解開後為 `flare-on.com.`；registry `r0` 也是用同樣的方式來 extract，解開後得到 `b3s7_sp3llcheck3r_ev3r`，將兩者組起來後就是 flag 了。不過這邊我是直接動態追 function 在寫入 registry 時做了什麼操作，之後就可以推得 flag，所以對 registry 的處理並沒有什麼印象。
 
 
 
