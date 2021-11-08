@@ -6,6 +6,10 @@
 
 
 
+Official solution： https://www.mandiant.com/resources/flare-on-8-challenge-solutions
+
+
+
 ### 01 - credchecker
 
 看 javascript 能得知帳號密碼分別為 `Admin` 與 `Z29sZGVudGlja2V0`：
@@ -978,6 +982,356 @@ open('part2.txt', 'w').write(code_dec.decode())
 
 
 ### 09 - evil
+
+比預期使用了更多的技巧 ＸＤ，因此這部分大多參考 official solution。
+
+第九題提供一個 .exe，如果直接執行起來，程式會馬上結束，什麼事情都不會發生，而其實該程式使用到了下面所介紹的技術，讓我們逆向與分析時變得更加麻煩：
+
+#### String Obfuscation
+
+C++ 11 提供了 `constexpr` keyword，讓你能在 compile time 能夠 assign 一個 `const` 變數 expression 作為他的值，expression 包含了 function call 的回傳值、operation 的結果。而這也代表可以透過 define obfuscation function 來對字串做混淆：
+
+```cpp
+constexpr char obfuscatedXor(char a, char b) {
+	return ( (~((((~a) & 0xFF) | b) & (a | ((~b) & 0xFF)))) & 0xFF) & (((~((((~a) & 0xFF) | b) & (a | ((~b) & 0xFF)))) & 0xFF) | (char)(0xB7F748F3));
+}
+```
+
+選擇 XOR 的原因為 XOR 簡單有效，並且只需搭配一些數學算式就能讓線上工具解不出來。
+
+#### CRT Initialization functions
+
+程式可以在 CRT (**C** **R**un**T**ime) 去執行自己定義的 function 來做初始化，並且在 `main()` 呼叫前做完初始化。初始化的內容可以包含初始化全域變數、對 function 加上 hook、註冊 exception handler 等等
+
+
+
+#### API Hooking: Vectored Exception Handling
+
+VEH 是 windows 的 exception handler，並且優先於另一種 exception handler Structured Exception Handling (SEH)，若 VEH 已經註冊部分 exception，則 SEH 不能對那些 exception 做對應的處理，而 VEH 可以透過 API  `AddVectoredExceptionHandler` 來註冊。
+
+此題透過 VEH 作為 API Hook，首先會先將相關參數 push 到 stack 當中，並且 trigger exception，而此時 VEH 就成為跳板，會去 patch 我們觸發 exception 的位置的 instruction，之後在 VEH 結束回到原本執行位置時，執行到的就是已經放好參數的 `call eax`，而 `eax` 此時會放的是我們預計要執行 `API` 的 address。
+
+
+
+#### API Hooking: Detours with PolyHook2
+
+> API Hooking utilizing Detours is the process of replacing the first couple bytes of a function with a jump to a new address where one can implement pre and post execution of an API before returning to the original executing code
+
+API Hooking utilizing Detours 為一種透過替換 function 前面 instruction 的幾個 bytes 成 instruction `jmp XXX`，達到在執行 function 前能夠做一些 operation，最後在跳回去原本的 function 即可。這題當中使用了 hooking library [PolyHook2](https://github.com/stevemk14ebr/PolyHook_2_0) 作為 hooking engine，PolyHook2 本身提供了大量的 hook 方式可以使用，也包含 VEH handler 的 hook，不過本題是自己嗑了一個類似功能的
+
+
+
+#### Anti-Disassembly
+
+方式有很多種，不過目標都是要建立 logic problem，讓 disassembler 以及 decompiler 沒辦法好好的解析而壞掉，而這題在 trigger exception 的 instruction 後塞了一個 `jz/jnz` 的 instruction，但是後續在做完 VEH handler 後跳回去的是該 instruction 中間的部分。如果直接從 `jz/jnz` instruction 開始解析，則會無法分辨後續 instruction 的正常執行順序，也會讓 disassembler / decompiler 壞掉。解決方法為 patch 掉 `jz/jnz` 成 `\x90`，以下 IDA 腳本為 @hexrabbit 協助撰寫：
+
+```python
+pattern = [
+    b'3\xc0\xf7\xf0',
+    b'3\xc0\x8b\x00',
+    b'3\xdb\xf7\xf3',
+    b'3\xdb\x8b\x1b',
+    b'3\xff\xf7\xf7',
+    b'3\xff\x8b?',
+    b'3\xf6\xf7\xf6',
+    b'3\xf6\x8b6'
+]
+
+import idaapi
+
+patch = b'\x90\xff\xd0'
+code_start = 0x4023d0
+code_end = 0x4051b0
+
+while code_start <= code_end:
+    bs = idaapi.get_bytes(code_start, 4)
+    if bs in pattern:
+        idaapi.patch_bytes(code_start + 4, patch)
+        code_start += 7
+    else:
+        code_start += 1
+```
+
+
+
+#### Anti-Debugging Techniques
+
+- `IsDebuggerPresent` - Determined by checking `PEB.BeingDebugged` (offset 0x02) to be set
+
+- `IsRemoteDebuggerPresent` - Calls `CheckRemoteDebuggerPresent` on current process and checks if the return has a debug port
+
+- IsNtGlobalFlag - Checks the `PEB.NtGlobalFlag` (offset 0x68) for the following flags described:
+
+  | Flag                         | Value |
+  | ---------------------------- | ----- |
+  | FLG_HEAP_ENABLE_TAIL_CHECK   | 0x10  |
+  | FLG_HEAP_ENABLE_FREE_CHECK   | 0x20  |
+  | FLG_HEAP_VALIDATE_PARAMETERS | 0x40  |
+
+- `IsSeDebugPrivsEnabled` - This sample doesn’t enable `DebugPrivs` so if they are it is a red flag. Another test that is better for this kind of test, but not implemented is to check the parent process and see if that process has DebugPrivs enabled
+
+- `IsHardwareBreakpointPresent` - This checks if any of the hardware breakpoints are set by checking the CONTEXT record for the running thread
+
+- IsTooSlow - This check is a simple timing check that does a simple back to back call to `GetTickCount` and compares the delta and looks for a threshold of anything over **two seconds** constitutes debugging
+
+這些 anti-debug function 會一直被呼叫，解法如下：
+
+- patch `ExitProcess` - 因為這些 anti-debugger 最後都會 call `ExitProcess`，因此如果能修改 `ExitProcess` 成馬上 return，則可以繞過
+- kill anti-debug thread - 把所有 anti-debug 的 thread 給 kill 掉
+- Scylla Hide plugin - 直接用工具幫你在 anti-debug 的 function 做 hook
+
+我自己是選 Scylla Hide plugin，不過當初也有想過 patch `ExitProcess`，而 kill anti-debug thread 是比較不好的做法，因為他的 thread 會在各式各樣的地方被呼叫到。
+
+除此之外還有兩個 anti-virtualization 以及 anti-debug 只會被呼叫一次：
+
+- anti-debug
+
+  - PatchDbg `BreakPoint`
+    - `DbgBreakPoint` is resolved and the first byte of the function is replaces with a ret instruction (0xC3)
+  - Patch `DbgUiRemoteBreakIn`
+    - Patching `DbgUiRemoteBreakin` goes a step further and inserts shellcode that will call `TerminateProcess` when this function is called
+
+- anti-virtualization - detect running in either VmWare or VirtualBox
+
+  - VMware
+
+    - 某些 privileged instruction 像是 `in` `out` 在 VMware 內被執行時，會變成對 host OS 的請求，而不是在 VMware 當中時會 trigger exception，由此可區分是否在 VM 當中
+
+    - Basically, VMware emulates near execution transfers outside the **CS:limit** incorrectly, in that it completes the transfer (changes EIP and modifies the stack when applicable) before raising the General Protection Fault. Physical processors raise the fault before actually doing anything.
+
+      To test this in Windows user-mode, create a < 4GB code segment (`ZwSetLdtEntries`), then transfer into it (change CS), and with an exception handler in place, try doing e.g. a near RET out of it (like PUSH -1 / RET). If you're running natively (or in accelerated mode in VMware), then EIP will still be within the **CS: limits** and ESP will remain unchanged; if you're running in emulation mode (ring-0 or with acceleration disabled), EIP will be above the **CS: limit** and the return address will have been popped
+
+      - 參考資料：https://eeyeresearch.typepad.com/blog/2006/09/another_vmware_.html
+
+  - VirtualBox
+
+    - 執行 WMI query `SELECT * FROM Win32_PnPEntity`，如果是 VirtualBox 則會有 `PCI\\VEN_80EE&DEV_CAFE`，因此比較是否有對應的 sha1 即可
+
+
+
+以下 walk through 的順序參考 solution，並會補充 solution 內的資訊：
+
+如果用 Procmon 看 process 的行為，若 anti-debug 的部分能順利通過的話，會發現在載入圖片後程式就馬上終止，官方 solution 是說可以看出 main function 需要設置環境變數，不過我當初是逆到 main function 才知道要傳入參數作為 server 的 IP。
+
+而在 VEH hook 的部分，會看到類似以下的 assembly 會出現多次：
+
+```asm
+mov dword ptr [ebp-10h], 246132h ; temporary storage
+mov dword ptr [ebp-18h], 66FFF672h ; temporary storage
+add eax, 3039h ; unrelated
+mov dword_6CFBD8, eax ; unrelated
+lea eax, [ebp-38h] ; stack pointer stored in EAX
+mov [ebp-14h], eax ; stack pointer stored on stack
+push dword ptr [ebp-14h] ; push stack pointer
+mov edx, [ebp-10h] ; move temporary hex value to EDX
+mov ecx, [ebp-18h] ; move temporary hex value to ECX
+xor eax, eax ; zero EAX
+mov eax, [eax] ; derefence NULL pointer
+```
+
+不過我們想知道的是 VEH 是在什麼時候被註冊的，能有的資訊為在第一次被呼叫前就已經註冊完畢，因此從 CRT 的 entry 一步步追，可以發現有一個地方明顯在 traverse 整個 initialized function table 做初始化，一個個跟就能發現其中一個就是在註冊 VEH。而 exception handler 做的行為大致如下：
+
+1. 建立一個 static variable
+   - 可以在後續的 function call 使用
+   - impl by Microsoft compiler
+2. `VirtualProtect` 將 EIP+3 設為 RWX，並將接下來執行到的 insn patch 成 `call eax` (`ff d0`)
+3. `VirtualProtect` 再將那一塊記憶體改回 R-X
+4. 回去原本觸發 exception 的地方，執行 `call eax` 
+
+
+
+一個常見間接 call API 或載入 library 的方法為建立一組 API exported name 的 hash 值，之後在搜尋對應的 hash 取得對應的資料，此題一開始在 initialization 時透過 `LoadLibrary` 載入以下 library：
+
+```
+0x176684 / ntdll / 09 / 0f
+0x246132 / kernel32 / 0c / 0f
+0x052325 / ws2_32 / 0a / 0f
+0x234324 / user32 / 0a / 0f
+0x523422 / advapi32 / 0c / 0f
+0x43493856 / gdi32 / 09 / 0f
+0x4258672 / ole32 / 09 / 0f
+0x7468951 / oleaut32 / 0c / 0f
+```
+
+並且儲存到 map 當中，solution 當中稱作 `dll_map_modules`。另一個 map 是儲存 id : obfuscated string 的 mapping，而搜尋順序如下：
+
+- 找 `dll_map_modules` 是否有 key
+- 找 obfuscated string 是否有 key
+
+在了解這支程式是如何呼叫 API，並且利用 VEH 做跳板後，用動態追蹤會發現程式前半段的呼叫流程如下：
+
+```cpp
+// anti-debug
+VirtualProtect(ntdll.DbgBreakPoint, 1, 40, bdfe58);
+VirtualProtect(ntdll.DbgBreakPoint, 1, 20, bdfe58);
+VirtualProtect(ntdll.DbgUiRemoteBreakin, E, 4, bdfe58) (PAGE_READWRITE);
+DbgUiRemoteBreakin + VirtualProtect(ntdll.DbgUiRemoteBreakin, E, 20, bdfe58);
+
+// anti-VirtualBox
+oleaut32.SysAllocString("ROOT\\CIMV2");
+ole32.CoInitialize(0);
+com9cse.CoCreateInstance(6858b0 (4458B0 in ida), 0, 1, 6858b0, cffe50);
+com9cse.CoSetProxyBlanket(1087ab8, a, 0, 0, 3, 3, 0, 0);
+oleaut32.SysAllocString("WQL");
+oleaut32.SysAllocString("SELECT * FROM Win32_PnPEntity");
+oleaut32.SysAllocString("DeviceId");
+oleaut32.VariantInit(00cffd58);
+advapi32.CryptAcquireContextA(00cffdac, 0, 0, 1, 0);
+advapi32.CryptAcquireContextA(00cffdac, 0, 0, 1, 8);
+advapi32.CryptHashData(010933c8, "PCI\\VEN...", 2a, 0); // sha1
+advapi32.CryptGetHashParam(CPCreateHash, 2, 00cffd44, 00cffd7c (0x14));
+advapi32.CryptReleaseContext(CPAcquireContext);
+oleaut32.SysFreeString("SELECT * FROM Win32_PnPEntity");
+oleaut32.SysFreeString("DeviceId");
+oleaut32.SysFreeString("WQL");
+
+// anti-debug for loop
+// for loop 0
+kernel32.ExitProcess
+// for loop 1
+kernel.32.GetCurrentProcess
+kernel.32.CheckRemoteDebuggerPresent
+// for loop 2
+kernel32.ExitProcess
+// for loop 3
+kernel32.GetCUrrentThread
+kernel32.GetLastError (return 3F0 (NO_TOKEN))
+advapi32.OpenThreadToken
+advapi32.OpenProcessToken
+advapi32.LookupPrivilegeValueA
+advapi32.PrivilegeCheck
+kernel32.CloseHandle
+// for loop 4
+kernel32.GetCurrentThread
+kernel32.GetThreadContext
+// for loop 5
+kernel32.GetTickCount
+kernel32.Sleep
+kernel32.GetTickCount
+kernel32.Exit
+    ;
+// main - thread communicate
+CreateMutexA();
+CreateThread(0, 0, 9c2E70, bd82a8, 0, 0);
+CreateThread(0, 0, 9c2d50, bd82a8, 0, 0);
+inet_addr(argv[1]);
+WSAStartUp(202, FEA450);
+ws2_32.socket(2, 3, 11); // (AF_INET, SOCK_RAW, IPPROTO_UDP)
+```
+
+過程中會初始化 debug map，包含以下 elem：
+
+1.  IsDebuggerPresent
+2.  IsRemoteDebuggerPresent
+3. IsNtGlobalFlag
+4. IsSeDebugPrivEnabled
+5. IsHardwareBreakpointPresent
+6. IsTooSlow
+
+
+
+而後會開起一些 thread，做的事情即是 anti-debug：
+
+```
+// 執行太慢
+9c2cb0 --> GetTickCount --> Sleep --> GetTickCount --> ExitProcess
+-- fs[0] --> TEB
+
+// 檢查是否在被 debug
+9c27d0 --> 某個條件下 ExitProcess()
+9c28b0 --> 某個條件下 ExitProcess()
+
+9c2820 --> GetCurrentThread --> CheckRemoteDebuggerPresent
+9c2900 --> GetCurrentThread --> OpenThreadToken --> GetLastError --> GetCurrentProcess --> OpenProcessToken --> LookupPrivilegeValueA --> PrivilegeCheck
+```
+
+除此之外還有兩個 thread 會進行 communicate：
+
+```
+// handler
+9c4680 --> WaitForSingleObject --> WaitForSingleObject --> WaitForSingleObject --> ...
+
+// listener
+9c4310 --> GetCurrentThread --> WSAGetLastError --> CreateThread(2820) --> WaitForSingleObject --> GetCurrentThread --> recvfrom --> ...
+```
+
+listener 會執行 `recvfrom` 接收所有封包，而後檢查：
+
+1. UDP
+2. dest port 為 4356
+3. Evil Bit 要設 (RFC 3514)
+
+如果正確的話，則會執行 `ReleaseMutex` 以及  `ReleaseSemaphore`，而此時 handler 能取得程式執行權 (shared memory 被 unlock)，並拿收到的封包內容做處理，而之後的程式碼不僅僅是此 binary 模擬做惡意行為，同時也是解開 flag 的關鍵部分。
+
+後續會根據傳入封包的不同而有不同的 operaion，對應的 operation handle 如下：
+
+- 會去看 attacker 在 packet 傳送的 **opcode** 做不同的行為：
+  - 0 - echo
+    - 單純回傳 input
+  - 1 - `Rickroll` image
+    - 在 terminal 上 show rickroll 的圖片，並且發送一個假的 flag
+  - 2 - set encrypt key
+    - 一共有四把 key，分別對應到不同的字串 (`L0ve`, `s3cret`, `5Ex` and `g0d`)，在所有 key 都設置好的情況下，才能得到完整的 key 來做 decrypt 
+    - 如果傳送的字串是對的，程式會自動透過對字串做 CRC32，將其轉為對應的 key
+    - 這邊需要注意字串需要包含 null character 才會做 CRC32 才能
+  - 3 - get flag
+    - 拿 key 去與密文做 RC4 解密，並且送資料回去
+    - decrypt 動態追蹤時會發現應該是 `CALG_SEAL` 來 decrypt，但其實在一開始 initialization function list 時有一個 function 就是替 `CryptImportKey` 加上 hook，hook 會把 `CALG_SEAL` 轉為 `CALG_RC4`，除此之外並沒有做什麼特別的事情
+
+
+
+最後傳 opcode 0x3 就拿得到 flag 了，腳本如下：
+
+```python
+import time
+from scapy.all import *
+
+src_ip = '127.0.0.1'
+dst_ip = '127.0.0.1'
+idx = 0x1234
+payloads = []
+
+# # first
+# payload = '\x01\x00\x00\x00' # rick
+# payloads.append(payload)
+
+# second
+payload = '\x02\x00\x00\x00' # magic str
+payload += '\x05\x00\x00\x00'
+payload += 'L0ve'
+payloads.append(payload)
+
+payload = '\x02\x00\x00\x00' # magic str
+payload += '\x07\x00\x00\x00'
+payload += 's3cret'
+payloads.append(payload)
+
+payload = '\x02\x00\x00\x00' # magic str
+payload += '\x04\x00\x00\x00'
+payload += '5Ex'
+payloads.append(payload)
+
+payload = '\x02\x00\x00\x00' # magic str
+payload += '\x04\x00\x00\x00'
+payload += 'g0d'
+payloads.append(payload)
+
+# L0ve s3cret 5Ex g0d
+# finally
+payload = '\x03\x00\x00\x00' # send to magic
+payload += '\x02\x00\x00\x00MZ\x00\x00' # decrypt ?
+payloads.append(payload)
+
+idx = 0
+print(f"total: {len(payloads)}")
+for payload in payloads:
+    input(f'round {idx} ')
+    packet = IP(src=src_ip, dst=dst_ip, id=idx, flags=4) / UDP(sport=0x1234, dport=0x1104) / payload
+    send(packet)
+    idx += 1
+```
+
+P.S. 其實一些動/靜態的分析細節也只大概說明一下，複雜且相對沒那麼重要，主要是忘的差不多了，怕記到錯的 ＸＤ
 
 
 
