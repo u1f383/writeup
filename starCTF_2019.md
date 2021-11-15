@@ -1287,3 +1287,92 @@ control `rbx` (`[_dl_open_hook]`) 並執行 `call [rbx]`，也就是 `**_dl_open
 
 - `repz ret`: repz is a prefix that **repeats the following instruction** until **some register is 0**. Also, it only works on string instructions; otherwise the behavior is undefined. So what on earth is gcc doing generating a repz retq?
 
+
+
+### oob-v8
+
+```diff
+diff --git a/src/bootstrapper.cc b/src/bootstrapper.cc
+index b027d36..ef1002f 100644
+--- a/src/bootstrapper.cc
++++ b/src/bootstrapper.cc
+@@ -1668,6 +1668,8 @@ void Genesis::InitializeGlobal(Handle<JSGlobalObject> global_object,
+                           Builtins::kArrayPrototypeCopyWithin, 2, false);
+     SimpleInstallFunction(isolate_, proto, "fill",
+                           Builtins::kArrayPrototypeFill, 1, false);
++    SimpleInstallFunction(isolate_, proto, "oob",
++                          Builtins::kArrayOob,2,false);
+     SimpleInstallFunction(isolate_, proto, "find",
+                           Builtins::kArrayPrototypeFind, 1, false);
+     SimpleInstallFunction(isolate_, proto, "findIndex",
+diff --git a/src/builtins/builtins-array.cc b/src/builtins/builtins-array.cc
+index 8df340e..9b828ab 100644
+--- a/src/builtins/builtins-array.cc
++++ b/src/builtins/builtins-array.cc
+@@ -361,6 +361,27 @@ V8_WARN_UNUSED_RESULT Object GenericArrayPush(Isolate* isolate,
+   return *final_length;
+ }
+ }  // namespace
++BUILTIN(ArrayOob){
++    uint32_t len = args.length();
++    if(len > 2) return ReadOnlyRoots(isolate).undefined_value();
++    Handle<JSReceiver> receiver;
++    ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
++            isolate, receiver, Object::ToObject(isolate, args.receiver()));
++    Handle<JSArray> array = Handle<JSArray>::cast(receiver);
++    FixedDoubleArray elements = FixedDoubleArray::cast(array->elements());
++    uint32_t length = static_cast<uint32_t>(array->length()->Number());
++    if(len == 1){
++        //read
++        return *(isolate->factory()->NewNumber(elements.get_scalar(length)));
++    }else{
++        //write
++        Handle<Object> value;
++        ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
++                isolate, value, Object::ToNumber(isolate, args.at<Object>(1)));
++        elements.set(length,value->Number());
++        return ReadOnlyRoots(isolate).undefined_value();
++    }
++}
+ 
+ BUILTIN(ArrayPush) {
+   HandleScope scope(isolate);
+diff --git a/src/builtins/builtins-definitions.h b/src/builtins/builtins-definitions.h
+index 0447230..f113a81 100644
+--- a/src/builtins/builtins-definitions.h
++++ b/src/builtins/builtins-definitions.h
+@@ -368,6 +368,7 @@ namespace internal {
+   TFJ(ArrayPrototypeFlat, SharedFunctionInfo::kDontAdaptArgumentsSentinel)     \
+   /* https://tc39.github.io/proposal-flatMap/#sec-Array.prototype.flatMap */   \
+   TFJ(ArrayPrototypeFlatMap, SharedFunctionInfo::kDontAdaptArgumentsSentinel)  \
++  CPP(ArrayOob)                                                                \
+                                                                                \
+   /* ArrayBuffer */                                                            \
+   /* ES #sec-arraybuffer-constructor */                                        \
+diff --git a/src/compiler/typer.cc b/src/compiler/typer.cc
+index ed1e4a5..c199e3a 100644
+--- a/src/compiler/typer.cc
++++ b/src/compiler/typer.cc
+@@ -1680,6 +1680,8 @@ Type Typer::Visitor::JSCallTyper(Type fun, Typer* t) {
+       return Type::Receiver();
+     case Builtins::kArrayUnshift:
+       return t->cache_->kPositiveSafeInteger;
++    case Builtins::kArrayOob:
++      return Type::Receiver();
+ 
+     // ArrayBuffer functions.
+     case Builtins::kArrayBufferIsView:
+```
+
+- 仔細看在 **src/builtins/builtins-array.cc** 底下的 diff，會發現當 `array.oob()` 只會讀 1 或 2 個參數，不過由於第一個參數皆是 `this`，因此實際 user 傳入的參數只會是 0 或 1 個
+- 當參數量為 1 時，會去讀 `FixedDoubleArray::cast(array)[ array.length ]`，而當參數量為 2 時，會以第二個參數的值蓋寫 `FixedDoubleArray::cast(array)[ array.length ]`
+
+
+
+
+
+
+
+參考文章：
+
+- https://faraz.faith/2019-12-13-starctf-oob-v8-indepth/

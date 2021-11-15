@@ -97,7 +97,7 @@ JS engine optimize
 
   - [man](http://commondatastorage.googleapis.com/chrome-infra-docs/flat/depot_tools/docs/html/depot_tools_tutorial.html)
 
-- `ninja
+- `ninja`
 
 - `gclient` - Meta-checkout tool managing both subversion and git checkouts. It is similar to repo tool except that it works on Linux, OS X, and Windows and supports both svn and git. On the other hand, gclient doesn't integrate any code review functionality.
 
@@ -1175,9 +1175,1531 @@ The privileged process must own the capability lifecycle
 
 
 
+helpful d8 flag:
+
+```
+--allow-natives-syntax
+--print-opt-code
+--trace-deopt # deoptimize 的過程
+```
+
+
+
+---
+
+
+
+https://slides.com/ripsawridge/deck#/10
+
+hidden classes:
+
+- Objects have a "**hidden class**" (called a Map in V8)
+- The Map is the **first pointer** in every object
+- The Map describes the **layout in memory**
+- Adding/removing **properties changes the Map**
+
+**INLINE CACHES** TO MAINTAIN AND OBSERVE LAYOUT
+
+- An Inline Cache (IC) is a **listening site** placed in your code
+- We have them at **LOAD, STORE and CALL** locations
+- It **caches the Map of objects** that **pass by in the Feedback Vector** for the function
+- https://zh.wikipedia.org/wiki/%E5%86%85%E8%81%94%E7%BC%93%E5%AD%98
+
+Every function has a **Feedback Vector**. It's just an array that **holds state for each IC**
+
+
+
+---
+
+
+
+https://v8.dev/blog/fast-properties
+
+JavaScript objects mostly behave like **dictionaries**, with **string keys** and **arbitrary objects** as values
+
+- `["aaa": <object>]`
+- the different properties **behave mostly the same**, independent of whether they are **integer indexed** or not
+
+**Elements** (index 為數字) and **properties** (index 為 string) are stored in two separate data structures which makes adding and accessing properties or elements more efficient for different usage patterns
+
+The **HiddenClass** stores information about the shape of an object, and among other things, a mapping from property names to indices into the properties
+
+sometimes use a **dictionary** for the properties instead of a **simple array**
+
+
+
+- **Array-indexed properties** are stored in a separate **elements** store.
+- **Named properties** are stored in the **properties** store.
+- Elements and properties can either be **arrays or dictionaries**.
+- **Each** JavaScript object has a **HiddenClass** associated that keeps information about the object shape
+
+
+
+HiddenClasses serve as an **identifier** for the **shape of an object** (又稱作 Map) and as such a very important ingredient for V8's optimizing compiler and **inline caches**. The optimizing compiler for instance can directly **inline property accesses** if it can ensure a compatible objects structure through the HiddenClass
+
+In terms of properties, the most important information is the **third bit field**, which stores the number of properties, and **a pointer to the descriptor array**
+
+the same named properties in the same order — share the **same HiddenClass**
+
+In the background V8 creates a **transition tree** that **links the HiddenClasses together**. V8 knows which HiddenClass to take when you add, for instance, the property "a" to an empty object. This transition tree makes sure **you end up with the same final HiddenClass** if you add the **same properties in the same order** (用 back pointer 串起 ?)
+
+if we create a new object that gets a different property added, V8 creates a **separate branch** for the new HiddenClasses
+
+
+
+- Objects with the **same structure** (same properties in the same order) have the **same HiddenClass**
+- By default every new named property added causes a **new HiddenClass to be created**
+- Adding array-indexed properties does **not create new HiddenClasses**
+
+
+
+While JavaScript objects behave more or less like simple dictionaries from the outside, V8 tries to **avoid dictionaries** because they hamper certain optimizations such as **inline caches** which we will explain in a separate post.
+
+
+
+In-object vs. normal properties
+
+- V8 supports so-called **in-object properties** which are **stored directly on the object themselves**
+- These are the **fastest properties** available in V8 as they are accessible **without any indirection**
+- The number of in-object properties is predetermined by the **initial size of the object**
+- If more properties get added than there is space in the object, they are stored **in the properties store** (多的就放到另外一個 space). The properties store adds **one level of indirection** but can be grown independently.
+
+
+
+Fast vs. slow properties
+
+- The next important distinction is between **fast and slow properties**
+- Typically we define the properties stored in the **linear properties store as "fast"**
+  - Fast properties are simply accessed **by index** in the properties store
+- To get from the name of the property to the actual position in the properties store, we have to consult the descriptor array on the **HiddenClass**, as we've **outlined** before
+
+
+
+However, if many properties get added and deleted from an object, it can generate a lot of time and memory overhead to **maintain the descriptor array** and **HiddenClasses**
+
+- slow properties - An object with slow properties has a **self-contained dictionary as a properties** store
+
+All the properties meta information is **no longer** stored in the **descriptor array on the HiddenClass** but directly in the **properties dictionary** (不放在 hiddenclass 了)
+
+- Hence, properties can be added and removed **without updating the HiddenClass**
+- Since **inline caches don’t work with dictionary properties**, the latter, are typically slower than fast properties.
+
+
+
+- There are three different **named property types**: in-object, fast and slow/ dictionary
+  - **In-object properties** are stored directly on the **object itself** and **provide the fastest access**
+    - 直接在 object 內，空間有限但最快
+  - **Fast properties** live in the **properties** store, all the meta information is stored in the **descriptor array** on the HiddenClass
+    - 為 linear property，另外一個 space，meta 都存在 hiddenclass 的 descriptor array
+  - **Slow properties** live in a **self-contained properties dictionary**, meta information is **no longer shared** through the HiddenClass
+    - 在 hiddenclass 的某處存著 slow properties ptr (or buffer ?)
+- **Slow properties** allow for efficient property removal and addition but are **slower to access than the other two types**
+
+element type 有許多種，可以參考：https://source.chromium.org/chromium/chromium/src/+/main:v8/src/objects/elements-kind.h;l=1?q=elements-kind.h&sq=&ss=chromium
+
+Packed or Holey Elements
+
+- The first major distinction V8 makes is whether **the elements backing store** is **packed** or has **holes** in it. You get holes in a backing store if you **delete an indexed element**, or for instance, **you don't define it**
+
+if a property is not present on the receiver we have to **keep on looking on the prototype chain**.
+
+- Given that elements are **self-contained**, e.g. we don't store information about present indexed properties on the HiddenClass, we need a **special value**, called **the_hole**, to **mark properties that are not present**
+- This is crucial for the performance of Array functions. If we know that there are **no holes**, i.e. the elements **store is packed**, we can perform **local operations** without expensive lookups on the prototype chain
+
+Fast or Dictionary Elements
+
+- The second major distinction made on elements is whether they are **fast or dictionary-mode**
+
+- Fast elements are simple **VM-internal arrays** where the **property index** maps to the **index in the elements store**
+
+- However, this simple representation is rather wasteful for very **large sparse/holey arrays** where only **few entries are occupied**
+
+  - In this case we used a **dictionary-based representation** to save memory at the cost of slightly slower access, e.g.
+
+    ```js
+    const sparseArray = [];
+    sparseArray[9999] = 'foo'; // Creates an array with dictionary elements.
+    ```
+
+**Smi and Double Elements**
+
+- For fast elements there is another important distinction made in V8
+
+- For instance if you only store integers in an `Array`, a common use-case, the GC does not have to look at the array, as integers are directly encoded as so called **small integers (Smis)** in place
+
+- Another special case are Arrays that **only contain doubles**. Unlike Smis, floating point numbers are usually represented as **full objects occupying several words**
+
+  - However, V8 stores **raw doubles** for **pure double arrays** to avoid memory and performance overhead
+
+    ```js
+    const a1 = [1,   2, 3];  // Smi Packed
+    const a2 = [1,    , 3];  // Smi Holey, a2[1] reads from the prototype
+    const b1 = [1.1, 2, 3];  // Double Packed
+    const b2 = [1.1,  , 3];  // Double Holey, b2[1] reads from the prototype
+    ```
+
+**Special Elements**
+
+- With the information so far we covered 7 out of the 20 different element kinds
+- For simplicity we excluded 9 element kinds for TypedArrays, two more for String wrappers and last but not least, two more special element kinds for arguments objects.
+
+**The ElementsAccessor**
+
+- As you can imagine we are not exactly keen on writing Array functions 20 times in C++, once for every elements kind
+- That's where some C++ magic comes into play. Instead of implementing Array functions over and over again, we built the **ElementsAccessor** where we mostly have to implement only simple functions that access elements from the **backing store**
+- The ElementsAccessor relies on **CRTP** to create specialized versions of each Array function. So if you call something like slice on an array, V8 internally calls **a builtin written in C+**+ and dispatches through the **ElementsAccessor** to the specialized version of the function
+
+
+
+- There are **fast and dictionary-mode** indexed properties and elements
+- Fast properties can be **packed** or they can contain **holes** which indicate that an indexed property has been deleted
+- Elements are **specialized** on their content to speed up Array functions and reduce GC overhead.
+
+
+
+---
+
+https://www.youtube.com/watch?v=cvybnv79Sek&ab_channel=JSKongress
+
+https://docs.google.com/presentation/d/1UXR1H2elTdAYJJ0Eed7lUctCVUserav9sAYSidxp8YE/edit#slide=id.g28233222fb_0_0
+
+https://slides.com/ripsawridge/deck
+
+- **monomorphic** - 只看到一種 Map 而已
+- **polymorphic** - 兩種+
+
+
+
+**var hoisting**
+
+- Because variable declarations (and declarations in general) are processed before any code is executed, declaring a variable **anywhere** in the code is equivalent to declaring it **at the top**
+- This also means that a variable can appear to **be used before it's declared**. This behavior is called "**hoisting**", as it appears that the variable declaration is moved to the top of the function or global code.
+
+
+
+https://zhuanlan.zhihu.com/p/55903492
+
+
+
+v8 的 back pointer 指向上一個 transition map，當指向 `<undefined>` 時代表到結尾了，並且最終會指向相同的 `prototype` 以及 `constructor`
+
+
+
+JS object 使用方式像是 dictionaries 的模式：
+
+```js
+a = {}
+a.hello = 'world';
+a.owo = function () { return 0x1234; }
+```
+
+而根據 key 為 **integer** 或是 **string** 有不同的名稱：
+
+- integer - 稱作 **element**
+- string - 稱作 **property**
+
+不過 element 與 property 都有可能會以 dict 或是 array 的方式儲存，像是 property 有時會以 **simple array** 的方式儲存。而每個 object 都會有一個 **Hidden Class** (又稱作 Map) 描述 object 的結構 (shape)。
+
+- 但 v8 會盡量避免用 dict 的方式儲存，因為 inline cache 與等等情況下不能 support
+
+
+
+v8 內部的 **inline caches** 會使用到 hidden class 做 function 的加速，而 hidden class 是以 transition tree 的方式存在，當新增 property 時，會建立新的 hidden class，並將 back pointer 指回舊的 hidden class
+
+- 但是這邊 property 就是以 string 為 index 的 element，如果以數字為 index 就不會建立新的 hidden class
+
+
+
+v8 內部有使用 in-object property，是直接儲存在 object 內部，而存取這些 property 是最快的，因為不需要透過額外的 indirection (**fastest properties**)，不過 in-object 的大小在初始化 object 大小時就確定了
+
+- 就是會先用 **in-object property**，沒有空間才會去用 **property store**
+
+
+
+使用 **linear property store** 的話被稱作 **fast property**，因為 property 可以用 **index** 來存取，並且 property 還要去 hidden class 的 descriptor 找 property 對到的 key 的名字 (稱作 outline property (?))
+
+
+
+- slow property 會有 **self-contained dictionary** 作為 properties store，代表 property meta 直接存在這個 properties dictionary 而非 descriptor array (in hidden class)，因此更新 property 時不需要更新 hidden class
+- 這邊呼應 inline cache 無法 support dict 的情況，因此才被稱作 slow property
+
+
+
+統整一下， **named property types** 一共有三種： in-object, fast and slow/ dictionary
+
+- **In-object properties** - 直接存在 object 內，空間有限但最快
+- **Fast properties** - 存在於 linear property store，metadata 放在在 hiddenclass 的 descriptor array
+- **Slow properties** - property 有 self-contained properties dictionary，並且 metadata 存在 property store 當中
+  - slow 在對 update / add / remove 資料時很有效率，但在 call function 時無法用 inline，比其他兩個慢
+
+
+
+---
+
+
+
+https://zhuanlan.zhihu.com/p/55903492
+
+`FixedArray` 對應到 fast-properties
+
+- 儲存除了 in-object 的 value (number / pointer)
+
+`HashTable` 對應到 slow-properties
+
+in-object properties 類似 fast-properties 但直接存在 object 當中
+
+Map objecg 本身的 map 指向 metamap
+
+
+
+flow
+
+- in-object 在 instance 建立時就已經分配好大小
+- 當 in-object 使用完畢，會接著用 PropertyArray (DescriptorArray 用來存 key name)
+- 雖然 PropertyArray 會動態擴充，但用太多時會變成 dictionary 模式 (slow)
+  - 不會有 in-object property，map descriptor len 為 0，意即直接存在 `NameDictionary` 中 (也就是 property back store)
+  - slow property 用 hashtable 存，但是 Entry detail 會紀錄 element 的順序
+
+什麼時候會轉換，用太多的定義為何？
+
+- v8 當中有兩種 property 的定義方式
+  - `a['b'] = 0` or `a.b = 0` - NamedStore
+    - `PropertyArray` 的 element 數量大於 128 或全部 attribute 大於 1020
+  - `a[b] = 0` - KeyedStore (dynamic)
+    - `PropertyArray` 的 attribute 不能超過 inobject properties
+
+fast mode memory 的使用來源
+
+- descriptor array
+- transition tree (backpointers)
+  - 指向 parent map，如果沒 parent 就會指向 map constructor，發生幾次 transition 就有幾個 map
+  - 每個 map 80 bytes
+- inobject properties
+- property array
+
+
+
+object literal 就是用 `{}` 所建立的 instance
+
+
+
+function `JSObject::MigrateSlowToFast` 將 `NameDictionary` 轉為 `FixedArray`
+
+- 反之 `JSObject::MigrateFastToSlow` 則是將 `FixedArray` 變成  `NameDictionary`
+- 不太懂為什麼 slow 能轉成 fast，不過文章說 object literal instance 的 attr 個數如果 `1021 > n >= 128`，會直接建 slow instance，之後再嘗試將其轉乘 fast instance，即 `MigrateSlowToFast`
+
+function `Map::TooManyFastProperties` 會回傳是否達到 Fast 上限，之後會呼叫 `JSObject::MigrateFastToSlow` 來將 fast property 轉為 slow property
+
+- source: https://source.chromium.org/chromium/chromium/src/+/main:v8/src/objects/map-inl.h;l=180?q=TooManyFastProperties
+
+
+
+---
+
+
+
+**奇技淫巧学 V8**
+
+object property mode:
+
+- Dictionary(Slow) Mode 也稱作 hash mode
+- Stable(Fast) Mode
+
+小的 instance 會是 fast mode，而當：
+
+- 動態加太多 property
+- `delete` property
+  - `delete` **不是最後加上去**的 property（V8 >= 6.0）
+
+可以用 Runtime call 來看：
+
+```js
+%HasFastProperties(obj);
+%ToFastProperties(obj); // force
+```
+
+example:
+
+```js
+let obj = {'a': 1, 'b': 2};
+%HasFastProperties(obj); // true
+
+delete obj.a;
+%HasFastProperties(obj); // false
+// or
+delete obj.b;
+%HasFastProperties(obj); // true, 因為是最後
+```
+
+不過 `JSObject` 也是有可能會從 slow property 轉成 fast property，像是：
+
+```js
+function MagicFunc(obj) {
+    function FakeConstructor() {
+        this.a = 0;
+    }
+    FakeConstructor.prototype = obj;
+    new FakeConstructor();
+    new FakeConstructor();
+};
+
+var obj = {'a': 1, 'b': 2};
+delete obj.a;
+%HasFastProperties(obj); // false
+MagicFunc(obj);
+%HasFastProperties(obj); // true
+```
+
+properties / elements space 不足時會建立 (or copy) 一個更大的 `FixedArray`，而關於動態分配的情況以及 property 的轉變，可以參考下方：
+
+```js
+let obj = {};
+%DebugPrint(obj);
+
+DebugPrint: 0xdb2080c2a25: [JS_OBJECT_TYPE]
+ - map: 0x0db2082802d9 <Map(HOLEY_ELEMENTS)> [FastProperties]
+ - prototype: 0x0db208240629 <Object map = 0xdb2082801c1>
+ - elements: 0x0db2080406e9 <FixedArray[0]> [HOLEY_ELEMENTS]
+ - properties: 0x0db2080406e9 <FixedArray[0]> {}
+0x0db2082802d9: [Map]
+ - type: JS_OBJECT_TYPE
+ - instance size: 28
+ - inobject properties: 4
+ - elements kind: HOLEY_ELEMENTS
+ - unused property fields: 4
+ - enum length: invalid
+ - stable_map
+
+obj.x = 0;
+obj.y = 1;
+obj.z = 2;
+
+%DebugPrint(obj)
+DebugPrint: 0xdb2080c2a25: [JS_OBJECT_TYPE]
+ - map: 0x0db2082837d1 <Map(HOLEY_ELEMENTS)> [FastProperties]
+ - prototype: 0x0db208240629 <Object map = 0xdb2082801c1>
+ - elements: 0x0db2080406e9 <FixedArray[0]> [HOLEY_ELEMENTS]
+ - properties: 0x0db2080406e9 <FixedArray[0]> {
+    0xdb20824e9a5: [String] in OldSpace: #x: 0 (const data field 0)
+    0xdb20824fbb5: [String] in OldSpace: #y: 1 (const data field 1)
+    0xdb20824fce9: [String] in OldSpace: #z: 2 (const data field 2)
+ }
+0x0db2082837d1: [Map]
+ - type: JS_OBJECT_TYPE
+ - instance size: 28
+ - inobject properties: 4
+ - elements kind: HOLEY_ELEMENTS
+ - unused property fields: 1
+ - enum length: invalid
+ - stable_map
+
+obj[0] = 'a';
+obj[1] = 'b';
+
+%DebugPrint(obj)
+DebugPrint: 0xdb2080c2a25: [JS_OBJECT_TYPE]
+ - map: 0x0db2082837d1 <Map(HOLEY_ELEMENTS)> [FastProperties]
+ - prototype: 0x0db208240629 <Object map = 0xdb2082801c1>
+ - elements: 0x0db2080c456d <FixedArray[17]> [HOLEY_ELEMENTS]
+ - properties: 0x0db2080406e9 <FixedArray[0]> {
+    0xdb20824e9a5: [String] in OldSpace: #x: 0 (const data field 0)
+    0xdb20824fbb5: [String] in OldSpace: #y: 1 (const data field 1)
+    0xdb20824fce9: [String] in OldSpace: #z: 2 (const data field 2)
+ }
+ - elements: 0x0db2080c456d <FixedArray[17]> {
+           0: 0x0db20808bf09 <String[1]: #a>
+           1: 0x0db20808c1e5 <String[1]: #b>
+        2-16: 0x0db208040385 <the_hole>
+ }
+0x0db2082837d1: [Map]
+ - type: JS_OBJECT_TYPE
+ - instance size: 28
+ - inobject properties: 4
+ - elements kind: HOLEY_ELEMENTS
+ - unused property fields: 1
+ - enum length: 3
+ - stable_map
+
+obj.a = 'a';
+obj.b = 'b';
+obj.c = 'c';
+
+%DebugPrint(obj)
+DebugPrint: 0xdb2080c2a25: [JS_OBJECT_TYPE]
+ - map: 0x0db208283849 <Map(HOLEY_ELEMENTS)> [FastProperties]
+ - prototype: 0x0db208240629 <Object map = 0xdb2082801c1>
+ - elements: 0x0db2080c456d <FixedArray[17]> [HOLEY_ELEMENTS]
+ - properties: 0x0db2080c4b51 <PropertyArray[3]> {
+    0xdb20824e9a5: [String] in OldSpace: #x: 0 (const data field 0)
+    0xdb20824fbb5: [String] in OldSpace: #y: 1 (const data field 1)
+    0xdb20824fce9: [String] in OldSpace: #z: 2 (const data field 2)
+    0xdb20808bf09: [String] in ReadOnlySpace: #a: 0x0db20808bf09 <String[1]: #a> (const data field 3)
+    0xdb20808c1e5: [String] in ReadOnlySpace: #b: 0x0db20808c1e5 <String[1]: #b> (const data field 4) properties[0]
+    0xdb208250671: [String] in OldSpace: #c: 0x0db208250671 <String[1]: #c> (const data field 5) properties[1]
+ }
+ - elements: 0x0db2080c456d <FixedArray[17]> {
+           0: 0x0db20808bf09 <String[1]: #a>
+           1: 0x0db20808c1e5 <String[1]: #b>
+        2-16: 0x0db208040385 <the_hole>
+ }
+0x0db208283849: [Map]
+ - type: JS_OBJECT_TYPE
+ - instance size: 28
+ - inobject properties: 4
+ - elements kind: HOLEY_ELEMENTS
+ - unused property fields: 1
+ - enum length: invalid     
+ - stable_map
+```
+
+`JSObject` 的 member 有：
+
+- type：  instance 是一個 `JSObject`
+- inobject properties： instance 的 in-object property 空間
+- unused property fields： 沒有使用的 property 空間
+- instance size： instance 在 heap 當中的大小
+- constructor： instance 的 constructor
+- prototype： instance 的 prototype
+- stable[dictionary]： instance 目前的 property 狀態
+  - stable_map： 快速模式
+    - 用 map -> `instance_descriptors` -> `DescriptorArray` 當中的 name 來判斷 property **name**
+    - 在 `FixedArray` 找對應到的 **value**
+  - dictionary_map： 字典模式
+    - 用 Jenkins hash function 存取 property
+
+P.S. 在這時我發現因為 compress pointer 的關係，結構都不是這麼好看，因此可以去 chromium 看一下 class 的 source code 以及對應的欄位，這邊貼出 `JSObject` 的 source code 連結：
+
+- https://source.chromium.org/chromium/chromium/src/+/main:v8/src/objects/js-objects.h;l=305?q=JSObject&ss=chromium
+- `JSObjec` 繼承 ` JSReceiver`
+  - https://source.chromium.org/chromium/chromium/src/+/main:v8/src/objects/js-objects.h;l=305
+  - `v8::internal::JSObject*`
+  - 不過看起來不像是用 `%DebugPrint()` 印出來的格式
+- `JSReceiver` 繼承 `HeapObject`
+  - https://source.chromium.org/chromium/chromium/src/+/main:v8/src/objects/heap-object.h;drc=00a8ca06f8f356e7e25ad9eac59364d51884af30;l=27
+- `HeapObject` 繼承 `Object`
+  - https://source.chromium.org/chromium/chromium/src/+/main:v8/src/objects/objects.h;drc=00a8ca06f8f356e7e25ad9eac59364d51884af30;l=272
+
+gdb 斷點：
+
+- `JSReceiver::initialize_properties` 
+- `Factory::JSFunctionBuilder::BuildRaw`
+  - https://source.chromium.org/chromium/chromium/src/+/main:v8/src/heap/factory.cc;l=3764
+
+
+
+v8 的 isolate struct 為 `v8::internal::Isolate`，map struct 為 `v8::internal::Map`，還有 `v8::internal::Object` 等等。
+
+`v8::internal::HeapObject` 的記憶體結構如下：
+
+```
+$7 = {
+  <v8::internal::Object> = {
+    <v8::internal::TaggedImpl<v8::internal::HeapObjectReferenceType::STRONG, unsigned long>> = {
+      static kIsFull = true,
+      static kCanBeWeak = false,
+      ptr_ = 63638667061245 // 0x39e10824e7fd
+    },
+    members of v8::internal::Object:
+    static kHeaderSize = 0
+  }, <No data fields>}
+```
+
+- 像這種 v8 object，address 傳入的似乎都是在 isolate 的記憶體區塊
+
+
+
+**V8 的記憶體管理機制**
+
+https://deepu.tech/memory-management-in-v8/
+
+JavaScript is single-threaded V8 also uses a single process per **JavaScript context**
+
+- Heap Memory
+
+  - 最大塊的記憶體
+
+  - Garbage Collection(GC) 發生的地方，但只會在 Young and Old space 發生
+
+  - **New Space** (又稱 **young** generation)
+
+    - **new objects** live and most of these objects are **short-lived**
+    - space is **small** and has two **semi-space**
+    - managed by the “**Scavenger(Minor GC)**”
+    - 大小可以用 `--min_semi_space_size` 以及 `--max_semi_space_size` 控制
+
+  - **Old Space** (又稱作 **Old** generation)
+
+    - objects that survived the “New space” for **two minor GC cycles** are moved to
+
+      space is managed up by the **Major GC(Mark-Sweep & Mark-Compact)**
+
+    - 可以用 `--initial_old_space_size` 與 `--max_old_space_size` 來控制大小
+
+      - Old pointer space - Contains **survived objects** that **have pointers to other objects**
+      - Old data space - Contains **objects** that just **contain data**(no pointer to other objects)
+        - Strings, boxed numbers, and arrays of unboxed doubles are moved here after **surviving in “New space” for two minor GC cycles**
+
+  - **Large object space**
+
+    - This is where objects which are **larger than the size limits of other spaces live**
+    - Each object gets its own **mmap'd** region of memory
+    - Large objects are **never** moved by the garbage collector
+
+  - **Code-space**
+
+    - This is where the **Just In Time(JIT) compiler** (turbofan) stores **compiled code Blocks**
+    - This is the only space with **executable memory** (although Codes may be allocated in “**Large object space**”, and those are executable, too)
+
+  - **Cell space, property cell space, and map space**
+
+    - These spaces contain **Cells, PropertyCells, and Maps**, respectively
+    - Each of these spaces contains objects which are all the **same size** and has some constraints on what kind of objects they point to, which simplifies collection
+
+  - Each of these spaces is composed of **a set of pages** (by mmap). Each page is **1MB** in size, except for **Large object space**
+
+- **Stack**
+
+  - This is the stack memory area and there is **one stack per V8 process**
+  - This is where **static data** including **method/function frames**, **primitive values**, and **pointers to objects** are stored
+  - 大小可以用 `--stack_size` 調整
+
+
+
+**Functions** are just objects in JavaScript
+
+
+
+V8 manages the heap memory by **garbage collection** (GC)
+
+- Free those objects that are **no longer referenced from the Stack directly** or **indirectly**(via a reference in another object) to make space for new object creation
+- **Orinoco** is the codename of the **V8 GC project** to make use of **parallel**, incremental and concurrent techniques for garbage collection, to free the main thread
+  - Minor GC (Scavenger)
+    - keeps the **young** or **new** generation space compact and clean
+      - 只負責清理 young 的 GC
+    - Objects are allocated in new-space, which is fairly small (**1 ~ 8 MB**, depending on behavior heuristics)
+    - Allocation in “**new space**” is very cheap: there is an **allocation pointer** which we increment whenever we want to reserve space for a new object
+      - allocation pointer 在要保留 space 時會增加，到結尾時 minor GC 會被 trigger，使用 Cheney’s algorithm 實作 GC，又被稱作 Scavenger
+    - 兩個相同 size 的 semi-space： `to-space` and `from-space`
+      - Most allocations are made in **from-space** 但除了一些特別的 object，如 executable Codes 一定會被 allocate 到 old-space
+      - 所以當 from-space 滿的時候就會觸發，從 root 開始 traverse：
+        - in-used / 被 in-used refenece - 丟到 to-space，並且更新 reference pointer
+        - 全部 scan 完後，**to-space** 直接變成 **from-space**，不但同時減少 fragment，也把沒用到的 free 掉了
+      - 但是結束後還是沒有空間該怎麼處理？ trigger **second minor GC**
+        - alive object - First-time survivors 被丟到 to-space，第二次開始就會丟到 old space (因為長期 alive)
+        - non-alive 直接在 from-space 被清掉
+        - to-space 跟 from-space 交換
+        - 新的被分配到 from-space
+    - 大多數 ojbect 都是在 new space 待一下，馬上就被 Minor GC 清掉
+  - Major GC
+    - 清理 old generation space，在 old-space 沒有空間時被觸發
+    - 大小為動態計算，並且 old-space 會被 minor GC 逐漸填滿
+    - 使用 **Mark-Sweep-Compact algorithm** 而非 Scavenger，是因為 Scavenger 對小記憶體很有效，但是在大塊記憶體時會有大量的 overhead (如 copy data)
+      - 使用 tri-color(white-grey-black) marking system
+      - 分成三步驟：
+        - **Marking**
+          - First step, common for both algorithms, where the garbage collector 用來辨識哪些用哪些沒用
+          - The objects in use or **reachable from GC roots(Stack pointers)** recursively are marked as **alive**
+          - It’s technically a DFS of the heap which can be considered as a DG
+        - **Sweeping**
+          - The garbage collector traverses the heap and **makes note of the memory address of any object that is not marked alive**
+          - This space is now marked as **free** in the **free list** and **can be used to store other objects**
+        - **Compacting**
+          - After sweeping, if required, all the survived objects will be **moved to be together**
+          - This will **decrease fragmentation** and increase the performance of allocation of memory to newer object
+          - compact by heuristic
+      - 被稱作 stop-the-world GC，因為在清掃過程中可能會出現暫停 (pause)，不過 v8 有一些機制可以避免：
+        - **Incremental GC**
+          - GC is done in **multiple incremental steps** instead of one
+        - **Concurrent marking**
+          - Marking is done **concurrently** using **multiple helper threads** without affecting the main JavaScript thread
+          - **Write barriers** are used to **keep track of new references between objects** that JavaScript creates while the **helpers are marking concurrently**
+        - **Concurrent sweeping/compacting**
+          - Sweeping and compacting are **done in helper threads concurrently** without affecting the main JavaScript thread
+        - **Lazy sweeping**
+          - Lazy sweeping involves **delaying the deletion of garbage** in pages until memory is required
+    - 總結一下流程：
+      - 假設多次 minor GC cycles 執行完畢，並且 old space 幾乎滿了，讓 V8 trigger “**Major GC**”
+      - Major GC 從 stack pointers 開始 recursively 遍歷 object graph，並 mark 那些 used memory (alive) objects，留下的 objects 為 garbage (Orphans) in the old space
+      - 上述使用多個 concurrent helper threads，並且每個 helper 都 follows a pointer (?)，不會影響到 main JS thread
+      - When concurrent marking is done or if the memory limit is reached, the GC does a **mark finalization step** using the **main thread**
+        - 會有 small pause time
+      - Major GC now marks all orphan object’s memory as free using **concurrent sweep threads**
+        - **Parallel compaction** 也會被 trigger，把相關連的 block 丟到相同 page，避免/減少 fragmentation
+        - Pointers are updated during these steps (換到新的 address 之類的)
+
+
+
+---
+
+
+
+https://zhuanlan.zhihu.com/p/38202123
+
+```js
+const object = { foo: 42 };
+Object.getOwnPropertyDescriptor(object, 'foo');
+```
+
+
+
+- `[[Value]]` - property 值
+- `[[Writable]]` - property 可以重新被 assign
+- `[[Enumerable]]` - 該 property 是否可以在 for-in loop
+- `[[Configurable]]` - 該 property 是否可以刪除
+
+
+
+---
+
+
+
+https://www.youtube.com/watch?v=Scxz6jVS4Ls&ab_channel=NearForm
+
+
+
+---
+
+
+
+```js
+function point(x, y) {
+    // will allocate this = {}
+    this.x = x;
+    this.y = y;
+}
+
+var p1 = new point(1, 2);
+var p2 = new point('a', 'b');
+```
+
+- p1, p2 share 相同的 Map / DescriptorArray
+
+
+
+JS 的：
+
+```js
+function getX(point) {
+    return point.x;
+}
+```
+
+可以看成 JS engine 當中的：
+
+```js
+function getX(point) {
+    return Runtime_Load(point, "x");
+}
+```
+
+1. 從 object 的 `<Map>` 中取得 `instance_descriptors`
+2. `instance_descriptors` 遍歷得到 key 的位置 (在 object 内 or 在 properties 中)
+3. 呼叫特定的方法讀取
+
+pseudo code 為：
+
+```js
+function Runtime_Load(obj, key) {
+    var desc = obj.map().instance_descriptors();
+    var desc_number = -1;
+    for (var i = 0; i < desc.length; i++) {
+        if (desc.GetKey(i) === key) {
+            desc_number = i;
+            break;
+        }
+    }
+
+    if (desc_number === -1) {
+    	return undefined;
+    }
+
+    var detail = desc.GetDetails(desc_number);
+    if (detail.is_inobject()) {
+    	return obj.READ_FIELD(detail.offset());
+    } else {
+    	return obj.properties().get(detail.outobject_array_index());
+    }
+}
+```
+
+當這段程式碼被大量執行後，js engine 會發現每次都找同一個位置，如果能透過紀錄起來 (cache) 以及簡單的檢查，就能減少搜尋的時間，增加效能。簡化後的流程如下：
+
+1. 檢查 object 的 `<Map>` 與之前 cache 的是否相同
+2. 如相同，直接從 cache 的位置讀
+3. 如不同，呼叫 `Runtime_Load`
+
+pseudo code:
+
+```js
+function getX(point) {
+    return LoadIC_x(point);
+}
+```
+
+````js
+function LoadIC_x(obj) {
+  if (obj.map() === cache.map) { // 比較是否為同個 map
+    if (cache.offset >= 0) {
+      return obj.READ_FIELD(cache.offset);
+    } else {
+      return obj.properties().get(cache.index);
+    }
+  } else {
+      return Runtime_LoadIC_Miss(obj, "x"); // 不是同個 map，不能直接用 cache
+  }
+}
+````
+
+```js
+function Runtime_LoadIC_Miss(obj, key) {
+    // … …
+    cache = {map : obj.map()};
+    if (detail.is_inobject()) {        
+        cache.offset = detail.offset();
+        // … …
+    } else {
+        cache.index = detail.outobject_array_index();
+        // … …
+    }
+}
+```
+
+- 當 miss 時可以存起來
+
+but will be defeated by:
+
+```js
+for (var i = 0; i < 10000; i++) {
+    if (i % 2) {
+        getX({x : 1});
+    } else {
+        getX({x : 1, y : 2});
+    }
+}
+```
+
+因此改動 `Runtime_LoadIC_Miss`，將 cache 由單一儲存改為 hash table mode，將遇到的 `<Map>` 及其 attr 存取位置全部cache 下来：
+
+```js
+function Runtime_LoadIC_Miss(obj, key) {
+    // … …
+    var cache = {map : obj.map()};
+    if (detail.is_inobject()) {        
+        cache.offset = detail.offset();
+        caches.push(cache);
+        // … …
+    } else {
+        cache.index = detail.outobject_array_index();
+        caches.push(cache);
+        // … …
+    }
+}
+```
+
+除此之外 `LoadIC_x` 也需做調整：
+
+```js
+function LoadIC_x(obj) {
+    for (var i = 0; i < caches.length; i++ ) {
+        if (obj.map() === caches[i].map) {
+            if (caches[i].offset >= 0) {
+                return obj.READ_FIELD(caches[i].offset); // object offset 即是
+            } else {
+                return obj.properties().get(caches[i].index); // 從 property 拿
+            }
+        }
+    }
+    return Runtime_LoadIC_Miss(obj, "x"); // miss
+}
+```
+
+- 雖然命中率上升，但是效能也下降 (branch check)
+
+P.S. point.x 可以稱作一個 **callsite**，把 x 稱為一條名為 x 的消息，而實際執行的 point (`{x : 1}` or `{x : 1, y : 2}`) 被為該 callsite 的 **receiver**。
+
+JavaScript 中很多操作的過程複雜，但對特定的 call (callsite) 來說 receiver 的 `<Map>` 變化一般很小，因此 v8 用 inline cache (IC) 來 cache function call 的實作以優化執行過程：
+
+```js
+obj.x;                // LoadIC(x)
+obj["x"];            // LoadIC(x)
+
+obj.x = 1;           // StoreIC(x)
+obj["x"] = 1;        // StoreIC(x)
+
+var key = "_";
+obj[key + "x"];      // KeyedLoadIC(x) 動態
+obj[key + "x"] = 1;  // KeyedStoreIC(x)
+```
+
+根據 receiver type 的多寡以及種類，會呈現不同的狀態：
+
+- uinitialized
+- premonomorphic - 訊息不足
+- monomorphic - type == 1
+- polymorphic - type > 1, type <= 4
+- megamorphic - type > 4
+- `kMaxPolymorphicMapCount = 4`
+- `kMaxKeyedPolymorphism = 4`
+
+Profile-guided optimization (PGO) == profile-directed feedback (PDF) == feedback-directed optimization (FDO)，皆指 compiler 在 runtime 蒐集資訊來做 optimization
+
+
+
+Runtime call `%ToFastProperties()` 是直接呼叫 `v8::internal::JSObject::MigrateSlowToFast`，而若無 runtime call 使用，也能透過 function 的 side effect 來達成Ｌ。當 `StoreIC` (`LoadIC`) 並非 unitialized 時，每次更新 IC 都會跑 `MakePrototypesFast` --> `MigrateSlowToFast`，將 dict mode 優化成 fast mode：
+
+```js
+function MagicFunc(obj) {
+    function FakeConstructor() {
+        this.x = 0; // StoreIC(x)
+    }
+
+    // copy <Map> 為 prototype，不與其他 object share
+    FakeConstructor.prototype = obj;
+
+    // StoreIC(x) state == UNINITIALIZED
+    new FakeConstructor();
+    // StoreIC(x) state == PREMONOMORPHIC
+
+    new FakeConstructor();
+    // StoreIC(x) state == MONOMORPHIC
+    // implicitly call MakePrototypesFast，從 slow mode 轉為 fast mode
+};
+```
+
+
+
+把某 object `FakeConstructor` 的 prototype 設為其他 object `b`，object `b` 的 `map` 會被 copy 一份，因此與 `a` 不在 share 同個 map (但是 map 的內容一樣)：
+
+```js
+let a = {x: 1};
+let b = {x: 1};
+%HaveSameMap(a, b); // true
+var FakeConstructor = function () {};
+FakeConstructor.prototype = b;
+%HaveSameMap(a, b); // false，因為 b 變成 FakeConstructor 的 prototype
+```
+
+- `%HaveSameMap()` 可以看兩個 object 的 `JSObject<Map>` 是否相同
+
+
+
+還有其他能夠透過 v8 side effect 來 trigger slowToFast，如：
+
+```js
+function MagicFunc_Alt(obj) {
+    var fakeObj = {};
+    function FakeLoad() {
+        fakeObj.x; // LoadIC(x)，即使 x 不存在
+    }
+
+    // CopyAsPrototype
+    fakeObj.__proto__ = obj;
+
+    // LoadIC(x) state == UNINITIALIZED
+    FakeLoad();
+    // LoadIC(x) state == PREMONOMORPHIC
+    FakeLoad();
+    // LoadIC(x) state == MONOMORPHIC
+    // implicitly call MakePrototypesFast, 從 slow mode 轉為 fast mode
+}
+```
+
+
+
+現實中應該會常使用到 `delete` operation，但即使能透過這種方式轉換成 fast mode，轉換過程也是有**額外的 overhead**，並且這種靠 side effect 的方法不太可靠。
+
+在 v8 >= 6.0，刪除的 property 滿足以下條件時不會轉換成 dictionary mode：
+
+- object 為 JavaScript 常規(?) instance (?)
+- property name 為常量化 string (不能為變數) or Symbol
+- 刪除的 property 必須是最後被加到 object 的
+- property 可以被刪
+- backpointer 引用的 type 必须是 `<Map>` (?)
+- 最後一次 Map Transition 只能由 object 新增 property 而觸發
+
+因為是最後加進去的，所以可以做類似 undo 的行為
+
+
+
+---
+
+
+
+v8 的 string 有以下幾種表達方式：
+
+- **SeqString**
+  - 在 V8 heap 内使用 (array-like) 連續空間來儲存 string
+  - 儲存格式分為 **OneByte**、**TwoByte **(Unicode)
+- **ConsString(first, second)**
+  - 在字串 concat 時，用 tree 來儲存 concat 後的 string
+  - 最小 ConsString 長度為 `kMinLength` = 13，小於的話會直接 copy
+  - 大於 13 會直接建立 tree structure
+- **SliceString(parent, offset)**
+  - 在字串切割時，用 **offset** and **[length]** 表示父字串 (parent) 的一部分
+  - SliceString 最小長度也是 `kMinLength` = 13 
+  - 在 SliceString 中被切割掉的字串**不會被** V8 GC 回收
+- **ThinString(actual)**
+  - 直接引用另一个字串 object (actual)
+  - 多數情況下與 **ConsString(actual, empty_string)** 等價
+  - 需要開 `--thin_strings`
+- **ExternalString**
+  - 在 V8 heap 外的字串
+  - 儲存格式分為 **OneByte**、**TwoByte **(Unicode)
+
+
+
+`ConsString()` 用 tree 來提升 concat 的效能，但是 operation 會比較複雜，實際上字串的生命週期可以分成二：
+
+- 構造期 - 使用 `ConsString` 提升多次 concat 的性能
+- 使用期 (access to read) - 使用 SeqString 降低 string 存取的複雜度
+
+如果使用字串相關的操作 (如 `charAt()`)，v8 混假設之後可能還會對該 string 有更多類似的操作，因此字串會由構造期進入使用期，V8 把多層的 ConsString copy (flatten) 成 SeqString 以降低後續處理的複雜度，此過程稱作 FlattenString。
+
+- 可以用 `%FlattenString` 強制 flatten
+- 而 implicit 的 flatten 包含：
+  - 轉為 number (`parseInt()`, `Number`)
+  - 讀取字串 (`s[0]` / `charCodeAt`)
+  - regexp 
+  - 其中 `Number` 的性能最好
+- 不過頻繁的 flatten 會影響效能，因此應該要在最後輸出字串時在使用
+
+> [UTF-8](https://link.zhihu.com/?target=https%3A//en.wikipedia.org/wiki/UTF-8) 是一種對 Unicode 的可變長度字串的編碼。
+> 字元範圍是 1 ~ 3 bytes，Unicode6.1 是 1 ~ 4 bytes
+
+v8 對外會以 flag 的方式包裝此種透過 side effect 達到的優化來避免開發者的疑惑 (如 `HINT_MANY_WRITES_EXPECTED`)，而在撰寫
+
+
+
+常量字串 (`InternalizedString`)
+
+- 在分配常量字串時會先計算 **Jenkins's one-at-a-time hash** 作為 key，在 string_table 中嘗試找出與 hash 相同的字串並比較內容是否相同 (`kMaxHashCalcLength` = 16383)
+  - 相同 - 直接回傳
+  - 不同 - 分配新的 (in old data space)
+- 可以透過 `%InternalizeString(str)` 直接將某 string 轉為 internalized
+
+```js
+abc = "abc";
+%DebugPrint(abc)
+DebugPrint: 0x2a7308250525: [String] in OldSpace: #abc
+0x2a73080402cd: [Map] in ReadOnlySpace
+ - type: ONE_BYTE_INTERNALIZED_STRING_TYPE
+ - instance size: variable
+ - elements kind: HOLEY_ELEMENTS
+ - unused property fields: 0
+ - enum length: invalid
+ - stable_map
+ - back pointer: 0x2a730804030d <undefined>
+ - prototype_validity cell: 0
+ - instance descriptors (own) #0: 0x2a73080401b5 <DescriptorArray[0]>
+ - prototype: 0x2a7308040171 <null>
+ - constructor: 0x2a7308040171 <null>
+ - dependent code: 0x2a73080401ed <Other heap object (WEAK_FIXED_ARRAY_TYPE)>
+ - construction counter: 0
+
+abcd = abc + "d"
+%DebugPrint(abcd)
+DebugPrint: 0x2a73080c5429: [String]: "abcd"
+0x2a7308040551: [Map] in ReadOnlySpace
+ - type: ONE_BYTE_STRING_TYPE
+ - instance size: variable
+ - elements kind: HOLEY_ELEMENTS
+ - unused property fields: 0
+ - enum length: invalid
+ - stable_map
+ - back pointer: 0x2a730804030d <undefined>
+ - prototype_validity cell: 0
+ - instance descriptors (own) #0: 0x2a73080401b5 <DescriptorArray[0]>
+ - prototype: 0x2a7308040171 <null>
+ - constructor: 0x2a7308040171 <null>
+ - dependent code: 0x2a73080401ed <Other heap object (WEAK_FIXED_ARRAY_TYPE)>
+ - construction counter: 0
+
+%InternalizeString(abcd)
+%DebugPrint(abcd)
+DebugPrint: 0x2a73080c5429: [String]: >"abcd"
+0x2a7308040691: [Map] in ReadOnlySpace
+ - type: THIN_ONE_BYTE_STRING_TYPE
+ - instance size: 16
+ - elements kind: HOLEY_ELEMENTS
+ - unused property fields: 0
+ - enum length: invalid
+ - stable_map
+ - back pointer: 0x2a730804030d <undefined>
+ - prototype_validity cell: 0
+ - instance descriptors (own) #0: 0x2a73080401b5 <DescriptorArray[0]>
+ - prototype: 0x2a7308040171 <null>
+ - constructor: 0x2a7308040171 <null>
+ - dependent code: 0x2a73080401ed <Other heap object (WEAK_FIXED_ARRAY_TYPE)>
+ - construction counter: 0
+```
+
+- `%InternaliszeString()` 內部會呼叫 `v8::internal::Factory::InternalizeString`，不過 `%InternaliszeString()` 沒辦法在平時被呼叫
+
+- 可以透過將 string 設為 object key 的 side effect 來 trigger
+
+  ```js
+  function internFunc(str) {
+      var obj = {};
+      obj[str] = true;
+      return Object.keys(obj)[0];
+  }
+  ```
+
+  - 先在 old data 分配一個 SeqString object，並將 `str` 內容 copy 進去
+  - object 的 `instance_type` 會被 mark 成 `kInternalizedTag`，代表常量字串
+  - 用 `ThinString<Map>` 替換原 object `str` 的 map，其中使用了新分配的 SeqString object
+  - 根據 ThinString 的大小調整 heap 
+    - 沒有 `ThinString` 就不能，因為常量字串 (new space) 與 非常量字串 (old space) 分配的位置不同，因此不能做 in-place internalization
+
+- 當字串被設置為 object property name 時，會被嘗試改造成常量化版本
+
+
+
+---
+
+
+
+[WebAssembly compilation pipeline](https://v8.dev/docs/wasm-compilation-pipeline)
+
+**Liftoff**
+
+- V8 first compiles a WebAssembly module with its baseline compiler, **Liftoff**
+- Liftoff is a **one-pass compiler**, which means it iterates over the WebAssembly code once and emits machine code immediately for each WebAssembly instruction
+- One-pass compilers excel at fast code generation, but can only apply **a small set of optimizations**
+- Indeed, Liftoff can compile WebAssembly code very fast, 10s of megabytes per second. Once Liftoff compilation is finished, the compiled WebAssembly module is returned to JavaScript
+
+Liftoff emits decently fast machine code in a very short period of time. However, because it emits code for each WebAssembly instruction independently, there is **very little room for optimizations**, like improving register allocations or common compiler optimizations like redundant load elimination, strength reduction, or function inlining
+
+This is why, as soon as Liftoff compilation is finished, V8 immediately starts to "tier up" the module by **recompiling** all functions with **TurboFan**, the optimizing compiler in V8 for both **WebAssembly and JavaScript**
+
+- TurboFan is a **multi-pass compiler**, which means that it builds multiple internal representations of the compiled code before emitting machine code. These additional internal representations allow **optimizations** and **better register allocations**, resulting in significantly faster code
+
+TurboFan compiles the **WebAssembly module** function by function. As soon as one function finishes, it immediately **replaces the function** compiled by Liftoff
+
+Any new calls to that function will then use the new, optimized code produced by TurboFan, not the Liftoff code. Note though that we don’t do **on-stack-replacement**. This means that if TurboFan finishes optimizing a function that was already invoked when only the Liftoff version was available, it will **finish its execution using the Liftoff version**
+
+
+
+**Code caching**
+
+- If the WebAssembly module was compiled with `WebAssembly.compileStreaming`, then the TurboFan-generated machine code will also **get cached**
+- When the same WebAssembly module is fetched again from the same URL, the module is **not compiled but loaded from cache**
+- More information about **code caching** is available in a separate blog post
+
+**Debugging**
+
+- As mentioned earlier, TurboFan applies optimizations, many of which involve **re-ordering code**, eliminating variables or even skipping whole sections of code
+- This means that if you want to set a breakpoint at a specific instruction, it might not be clear where program execution should actually stop. In other words, TurboFan code is not well suited for debugging
+- Therefore, when debugging is started by opening DevTools, all TurboFan code is replaced by Liftoff code again **("tiered down")**, as each WebAssembly instruction maps to exactly one section of machine code and all local and global variables are intact
+
+**Profiling**
+
+- To make things a bit more confusing, within DevTools all code will **get tiered up** (**recompiled with TurboFan**) again when the **Performance tab** is opened and the **"Record" button in clicked**. The "Record" button starts **performance profiling**. Profiling the Liftoff code would not be representative as it is only used while TurboFan isn’t finished and can be significantly slower than TurboFan’s output, which will be running for the vast majority of time
+
+
+
+https://www.youtube.com/watch?v=Scxz6jVS4Ls&ab_channel=NearForm
+
+雖然 copy 昂貴，不過還是 copy 需要的而已
+
+- nursery --> intermediate --> old space (generation) (通常會存在很久)
+
+major GC (full mark-compact)
+
+- scan 並 mark 所有 unreachable，並且放入 free list
+- 還是會 compact，但是不會 compact 所有 page
+
+Orinoco
+
+- goal - "free the main thread"
+  - help thread + main thread
+  - concurrent - no pause time
+    - marking
+    - compact + update
+    - sweep
+
+https://v8.dev/blog/jank-busters
+
+Escape analysis
+
+- In compiler optimization, **escape analysis** is a method for determining the **dynamic scope of pointers** – where in the program a pointer can be accessed. It is related to pointer analysis and shape analysis.
+- When a variable (or an object) is allocated in a subroutine, a pointer to the variable **can escape to other threads of execution**, or to **calling subroutines**. If an implementation uses **tail call optimization** (usually required for functional languages), objects may also be seen as escaping to called subroutines
+
+
+
+尾呼叫 (tail call) 是指一個函數裡的最後一個動作是**返回一個函式的呼叫結果**的情形，即最後一步新呼叫的返回值直接被當前函式的返回結果，此時，該尾部呼叫位置被稱為尾位置
+
+- 經過適當處理，**尾遞迴形式**的函式的執行效率可以被極大地最佳化
+- 尾呼叫原則上都可以通過**簡化函式呼叫棧**的結構而獲得效能最佳化（稱為「**尾呼叫消除**」），但是最佳化尾呼叫是否方便可行取決於執行環境對此類最佳化的支援程度如何
+
+
+
+https://blog.sessionstack.com/how-javascript-works-memory-management-how-to-handle-4-common-memory-leaks-3f28b94cfbec
+
+The main concept garbage collection algorithms rely on is the one of reference
+
+- An object is considered “garbage collectible” if there are zero references pointing to it
+- There is a limitation when it comes to **cycles** (a --> b , b --> a)
+
+Mark-and-sweep algorithm
+
+- In order to decide **whether an object is needed**, this algorithm determines whether the object is reachable
+-  inspects all roots and their children and marks them as active
+  - Anything that a root cannot reach will be marked as garbage
+
+what's memory leak?
+
+- memory leaks are pieces of memory that the application **have used in the past** but is **not needed any longer** but has **not yet been return back** to the OS or the pool of free memory
+
+four types of common JavaScript leaks
+
+- Global var
+
+  ```js
+  function foo(arg) {
+      bar = "some text";
+  }
+  // equal to
+  function foo(arg) {
+      window.bar = "some text";
+  }
+  ```
+
+  - please use `var` or add `use strict` in the beginning of js
+
+- Timers or callbacks that are forgotten
+
+- Closures
+
+  - **once a scope for closures is created for closures in the same parent scope, the scope is shared**
+
+- Out of DOM references
+
+
+
+https://zhuanlan.zhihu.com/p/38202123
+
+https://zhuanlan.zhihu.com/p/103750829
+
+
+
+https://docs.google.com/document/d/10qh2-b4C5OtSg-xLwyZpEI5ZihVBPtn1xwKBbQC26yI/edit?fbclid=IwAR0p3oIoh9w3Jv9AmrNSLoobahSdoKDg8g8N7cxyKMlkNgzuEtW5WPID_zM#heading=h.l3c73n8yohth
+
+
+
+use “root” register as a V8 heap base register we have to ensure that all the values previously accessible via the root register would be still accessible via the V8 heap base register
+
+- store there a pointer to the `v8::internal::Isolate` object
+  - 存一個指向 `v8::internal::Isolate` object 的 pointer
+
+
+
+四種方式
+
+- base points to the beginning, page aligned
+- base points to the beginning, 4Gbyte-aligned
+- base points to the middle, 4Gbyte-aligned (preferred one)
+- base points to the beginning, 4Gbyte-aligned, smi-corrupting
+
+
+
+V8 uses a **heap snapshot** to reduce the time it takes to create a new isolate (and possibly context)
+
+- At build time, a **snapshot of the heap** is created **using the serializer**, and **stored in a raw data file** that is distributed with the V8 binary called `snapshot_blob.bin`
+- When a **new isolate is created**, the snapshot file is **loaded into memory and deserialized to create an identical heap state**, saving time on startup
+
+Complicated unboxed doubles support
+
+- It would be hard to support **unboxed double fields** because of object field shifting when changing representation from Smi to Double or from Double to Tagged. However, it is **still doable**
+- Or we may decide to use a completely different approach for unboxing doubles which will also work for 32-bit architectures: we may consider using `FixedDoubleArray` as a **separate backing** for all the double properties
+- This would be a bit **less efficient** but more **GC friendly** approach than we have right now
+
+
+
+https://v8.dev/blog/lazy-unlinking
+
+Each function also has a **trampoline to the interpreter** and will **keep a pointer to this trampoline** in its `SharedFunctionInfo (SFI)`
+
+This trampoline will be used whenever V8 needs to **go back to unoptimized code**. Thus, upon deoptimization, triggered by passing an argument of a **different type** (bailout)
+
+If the function f1 is deoptimized, we need to make sure that the invalidated code will **not be executed again by invoking f2** (相同的 pointer 都必須要更新)
+
+Thus, upon deoptimization, V8 used to **iterate over all the optimized JavaScript functions**, and would **unlink those that pointed to the code object being deoptimized**. This iteration in applications with many optimized JavaScript functions became a **performance bottleneck**
+
+### Lazy unlinking
+
+- When such functions are invoked, V8 checks **whether they have been deoptimized**, unlinks them and then continues with their **lazy compilation**
+- 不在 GC 時回收而是只設 mark_for_deoptimization bit，並在下次呼叫此 function 時才做 **unlink it** and **jump to lazy compiled code**
+  - If these functions are never invoked again, then they will **never be unlinked** and the deoptimized code objects **will not be collected**
+  - However, given that during deoptimization, we invalidate all the **embedded fields of the code object**, we only **keep that code object alive**
+
+`CompileLazyDeoptimizedCode` 的另一方面要做的就是，從 JavaScript 函數中 unlink code field，並將其設置為 Trampoline 到 Interpreter 
+
+
+
+---
+
+https://docs.google.com/presentation/d/1Z6oCocRASCfTqGq1GCo1jbULDGS-w-nzxkbVF7Up0u0/edit#slide=id.p
+
+這篇講 deoptimize
+
+If a dynamic parameters check fails the deoptimizer deoptimizes the code:
+
+- **Discards** the optimized code
+- Builds the **interpreter frame** from the optimized stack/registers
+- Jumps to the **interpreter**
+
+
+
+deoptimizer 的行為：
+
+- Reads out **current stack frame** and **HW register** file into a buffer
+- Builds **interpreter frame(s)** from the (optimized) stack frame and registers
+  - Using information **emitted by the compiler** (aka `DeoptimizationInputData`)
+  - The information contains:
+    - **Shared function info** and **bytecode offset** to resume at
+    - Locations of **parameters in hardware registers/stack slots**
+    - Locations of **interpreter registers** (in hardware registers/stack slots)
+    - … for each **inlined frame**
+- Materializes objects that have been compiled away by **escape analysis**
+- Jumps to the **interpreter dispatch**
+
+
+
+https://www.zerodayinitiative.com/blog/2018/4/12/inverting-your-assumptions-a-guide-to-jit-comparisons
+
+
+
+https://www.youtube.com/watch?v=Fg7niTmNNLg&ab_channel=JSConf
+
+parser - full, "eager"
+
+- actually be called
+
+preparser - fast, "lazy"
+
+- definition
+- 如果有 `!` prefix，則會直接做 full eager (?)
+
+
+
+https://zhuanlan.zhihu.com/p/28590489 - 中文版
+
+https://medium.com/dailyjs/understanding-v8s-bytecode-317d46c94775
+
+V8 的 interpreter 是用 **Ignition**
+
+- Ignition is a register machine with an accumulator register
+- can think of V8's bytecodes as **small building blocks**
+- Each bytecode specifies its **inputs and outputs** **as register operands**. Ignition uses registers **r0, r1, r2, ...** and an **accumulator register**
+
+
+
+bytecode begin with `Lda` or `Sta`
+
+- `a` == **a**ccumulator
+- Ld == Load
+- St == Store
+
+e.g.
+
+```js
+function incrementX(obj) {
+  return 1 + obj.x;
+}
+incrementX({x: 42});  // V8’s compiler is lazy, if you don’t run a function, it won’t interpret it.
+```
+
+- 沒被執行前只會做 lazy parsing
+
+產生出來的 bytecode 為：
+
+```
+[generated bytecode for function: incrementX]
+Parameter count 2
+Register count 1
+Frame size 8
+   20 E> 0x2cc946d9fa32 @    0 : a5                StackCheck
+   30 S> 0x2cc946d9fa33 @    1 : 0c 01             LdaSmi [1]
+         0x2cc946d9fa35 @    3 : 26 fb             Star r0
+   45 E> 0x2cc946d9fa37 @    5 : 28 02 00 01       LdaNamedProperty a0, [0], [1]
+   39 E> 0x2cc946d9fa3b @    9 : 34 fb 00          Add r0, [0]
+   47 S> 0x2cc946d9fa3e @   12 : a9                Return
+   
+   
+0x2cc946d9f9e1: [FixedArray] in OldSpace
+ - map: 0x077c35c80801 <Map>
+ - length: 1
+           0: 0x2cc946d9f249 <String[#1]: x>
+```
+
+- `LdaSmi [1]` - loads the constant value `1` in the accumulator (acc)
+- `Star r0` - stores the value that is currently in the accumulator (acc) into **r0**
+- `LdaNamedProperty a0, [0], [1]` - loads a named property of **a0** into the accumulator
+  - **aX** refers to the **i**-th argument of `incrementX()`
+  - look up a named property on `a0`, and name is determined by the constant `0`
+    - In the example  `0` maps `x`, so this bytecode loads `obj.x`
+  - 4 is an **index of the so-called feedback vector** of the function `incrementX()`
+    - feedback vector contains **runtime information** that is used for **performance optimizations**
+- `Add r0, [6]` - adds r0 to the accumulator, resulting in `43`
+  - `6` is another **index of the feedback vector**
+- `Return` - returns the value in the accumulator
+
+
+
+https://www.youtube.com/watch?v=p-iiEDtpy6I&ab_channel=JSConf
+
+JS - dynamically typed
+
+https://www.youtube.com/watch?v=8aGhZQkoFbQ&ab_channel=JSConf
+
+
+
+https://mrale.ph/blog/2015/01/11/whats-up-with-monomorphism.html
+
+
+
+https://segmentfault.com/a/1190000039908658/en
+
+- object - `TaggedImpl`
+
+  - https://github.com/nodejs/node/blob/2883c855e0105b51e5c8020d21458af109ffe3d4/deps/v8/src/objects/tagged-impl.h#L24
+  - pointer tagging / pointer compression
+  - compiler, memory allocation at runtime will ensure that the address is aligned according to the word length
+
+- GC - 用 "Accurate GC, Precise GC" 而不是 "Conservative GC, Conservative GC"
+
+  - 為了避免意外 release 不該 release 的 memory，**conservative GC** 會將所有看起來像 pointer 的 address 給 mark 成使用中 (active)，這樣就不會出現意外釋放記憶體的問題
+
+- 儲存方式 - 可以想像 object 儲存：
+
+  ```js
+  type Object = Record<string, number>;
+  const obj = { field1: 1 };
+  ```
+
+  - key-pair 的方式應該很直觀，不過 number 的原因是因為他同時能代表 primitive，也能當作 reference 儲存記憶體
+
+
+
+JSObject 是由多個 class 所包裝起來
+
+- `Object` -->  `HeapObject` --> `JSReceiver` --> `JSObject`
+  - HeapObject --> kMapOffset
+  - JSReceiver --> kPropertyOrHashOffset
+  - JSObject --> kElementOffset
+
+如 `%DebugPrint()` 等稱作 runtime function，被定義在 **runtime.h** 當中
+
+runtime 時 v8 會選一個值作為 `expected_nof_properties`，當作 inobject attribute 的初始數字
+
+在 JS 當中，`Class` 只是一個語法糖，實際上為 `FUNCTION_TYPE`
+
+CreateObjectLiteral 跟 Create from class 得到的 object 有些差別，像是前者並不會保留額外多的  inobject properties 給 object，但是 create empty object literal 又會
+
+- https://github.com/nodejs/node/blob/fb180ac1107c7f8e7dea9c973844dae93b2eda04/deps/v8/src/init/bootstrapper.cc#L720
+- `kInitialGlobalObjectUnusedPropertiesCount` == 4
+
+
+
+```js
+const obj = {};
+const cnt = 19;
+for (let i = 0; i < cnt; i++) {
+  obj["p" + i] = 1;
+}
+%DebugPrint(obj);
+```
+
+
+
+```
+# 4
+DebugPrint: 0x3de5e3537989: [JS_OBJECT_TYPE]
+ #...
+ - properties: 0x3de5de480b29 <FixedArray[0]> {
+
+#19
+DebugPrint: 0x3f0726bbde89: [JS_OBJECT_TYPE]
+ #...
+ - properties: 0x3f0726bbeb31 <PropertyArray[15]> {
+
+# 20
+DebugPrint: 0x1a98617377e1: [JS_OBJECT_TYPE]
+ #...
+ - properties: 0x1a9861738781 <NameDictionary[101]>
+```
+
+
+
+`%DebugPrint()` show **FixedArray** because when the fast type is not used, `propertiesOrHash_ptr` points to a **empty_fixed_array**
+
+
+
+**slack tracking**
+
+https://v8.dev/blog/slack-tracking
+
+Slack tracking is a way to give new objects an initial size that is **larger than what they may actually use**, so they can have new properties added quickly. And then, after some period of time, to **magically return that unused space to the system**
+
+initial map 中會存放一個 counter (value 為 7)，當 constructor 被呼叫時就會 -1，到 0 的時候會將沒有使用到的空間收回 (透過 `JSFunction::CalculateExpectedNofProperties()`)，而多出來的空間會用 **filler** 去填滿，不過統計沒有使用到的空間應該只有 inobject property
+
+在 optimize function 時，如果使用到的 map 在往後可能會因為 counter 到 0 做優化而造成 map struct 的改變 (updating of instance size)，可能會有 side effect 的疑慮，因此也會順便 slack tracking，因為正常來說被 object 被當作參數使用數萬次應該已經做 slack tracking 了
+
+- 之後新增的 property 會被放到 backing store
+
+
+
+https://mrale.ph/blog/2015/01/11/whats-up-with-monomorphism.html
+
+monomorphism(1) / polymorhism(2+) / megamorphic (4+)
+
+- megamorphic - "give up tracking them"
+  - V8 **megamorphic ICs** can still continue to cache things but instead of doing it locally they will put what they want to cache into a **global hashtable**
+  - hashtable has **a fixed size** and entries are **simply overwritten on collisions**
+
+
+
+Monomorphic cache says **I’ve only seen type A**
+Polymorphic cache of degree N says **I’ve only seen A1, …, AN**
+Megamorphic cache says **I’ve seen a lot of things**
+
+
+
+https://www.youtube.com/watch?v=m9cTaYI95Zc&ab_channel=CSSConfAustralia
+
+https://slidr.io/mathiasbynens/v8-internals-for-javascript-developers#1
+
+element
+
+- PACKED_SMI_ELEMENTS - `[1, 2, 3]`
+  - then `push(4.56)`
+- PACKED_DOUBLE_ELEMENTS
+  - then `push('x')`
+- PACKED_ELEMENTS
+  - then `arr[9] = 1`
+- HOLEY_ELEMENTS (SMI / DOUBLE / ELEMENTS)
+  - 要檢查 undefined (hole)，所以很慢
+- lattice system
+
+- 一共有 21 種 element type
+  - https://source.chromium.org/chromium/v8/v8.git/+/ec37390b2ba2b4051f46f153a8cc179ed4656f5d:src/elements-kind.h;l=14
+
+NaN, Infinity, -0 由 double 的方式表示
+
+
+
+Turbofan 的 code (?)
+
+- https://source.chromium.org/chromium/chromium/src/+/master:v8/src/compiler/js-create-lowering.h;l=32;drc=ee9e7e404e5a3f75a3ca0489aaf80490f625ca27
+
+`%DebugPrintPtr` 又是另一個好用的 runtime function
+
 ## Resource
 
 - [V8 engine JSObject structure analysis and memory optimization ideas](https://medium.com/@bpmxmqd/v8-engine-jsobject-structure-analysis-and-memory-optimization-ideas-be30cfcdcd16)
 - [Objects in v8](https://segmentfault.com/a/1190000039908658)
 - [官方 documentation](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/docs/)
+- [V8引擎中基于推测的优化介绍](https://zhuanlan.zhihu.com/p/51047561)
+  - 原文：https://benediktmeurer.de/2017/12/13/an-introduction-to-speculative-optimization-in-v8/
 
