@@ -1470,3 +1470,5 @@ ptype /o struct tty_struct # with offset
 
 - https://ptr-yudai.hatenablog.com/entry/2021/07/26/225308
 - https://balsn.tw/ctf_writeup/20210717-googlectf2021/#fullchain
+- https://ret2.life/posts/Google-CTF-2021
+  - 這篇的 sbx escape 打法跟其他隊伍不太一樣，用的是 memory allocation 相關的手法，如果想要更了解 PartitionAllocation 可以參考這篇 writeup
