@@ -13,7 +13,7 @@ Partial RELRO   No canary found   NX enabled    No PIE          No RPATH   No RU
 
 
 
-程式非常簡單，NX，parent 的 seccomp 只允許 write，而 child 的 seccomp 能夠 open 以及 read，我們能 BOF 寫入大量的 gadget 做 ROP 來 exploit。不過 parent 與 child 只會共享 `fork()` 前的記憶體，在 `fork()` 後就以 COW 的機制來 handle 各自的記憶體，這樣無法用直觀的方式："寫到某處並讓 parent 讀取" 來印出 flag。觀察後發現 parent 會執行 `wait(&status)` 等待 child 結束，而 child 的 exit status 為 1 個 byte 的大小，可以用來傳遞一個字元的 flag。
+程式非常簡單，parent 的 seccomp 只允許 write，而 child 的 seccomp 能夠 open 以及 read，我們能 BOF 寫入大量的 gadget 做 ROP 來 exploit。不過 parent 與 child 只會共享 `fork()` 前的記憶體，在 `fork()` 後就以 COW 的機制來 handle 各自的記憶體，這樣無法用直觀的方式："寫到某處並讓 parent 讀取" 來印出 flag。觀察後發現 parent 會執行 `wait(&status)` 等待 child 結束，而 child 的 exit status 為 1 個 byte 的大小，可以用來傳遞一個字元的 flag。
 
 找到該如何傳遞 flag 後，下一步就是找 gadget 讓 child 與 parent 能夠執行同個 ROP 但有不同的行為，經過一陣子的測試與搜尋，最終用以下方法完成：
 
