@@ -45,7 +45,7 @@ Dynamic section at offset 0x2f14 contains 24 entries:
 
 
 
-`JMPREL (0x80482d8) ` section 中存的是 `Elf32_Rel`：
+`JMPREL (0x80482d8)` section 中存的是 `Elf32_Rel`：
 
 ```c
 typedef uint32_t Elf32_Addr;
@@ -351,7 +351,7 @@ r.interactive()
    0x4011b0 : add dword ptr [rax + 0x39], ecx ; fnsave dword ptr [rbp - 0x16] ; add rsp, 8 ; pop rbx ; pop rbp ; pop r12 ; pop r13 ; pop r14 ; pop r15 ; ret
    ```
 
-   與可控 rax 的 function 即可寫入。
+   與可控 rax 的 function 即可寫入 libc 到任意位址
 
 2. 將 stack 遷到 bss 時，呼叫 `_start` 也能在 stack 留下 libc address
 
