@@ -463,11 +463,11 @@ r.interactive()
 
 為了要做到 EL1 任意執行 shellcode，需要做下一步的準備。以下為 EL1 在使用 TTBR 的情況，當 address prefix 為 kernel mode 使用 TTBR1_EL1，當 address prefix 為 user mode 時使用 TTBR0_EL1：
 
-![image-20211116213001312](C:\Users\jerry\AppData\Roaming\Typora\typora-user-images\image-20211116213001312.png)
+![image-20211116213001312](../images/arm1.png)
 
 而 TCR_EL1 的 **T0SZ** 與 **T1SZ** 是控制 range of address translation：
 
-![image-20211116213232722](C:\Users\jerry\AppData\Roaming\Typora\typora-user-images\image-20211116213232722.png)
+![image-20211116213232722](../images/arm2.png)
 
 page walk — a translation from a virtual to a physical address
 
@@ -926,7 +926,7 @@ state
 
 
 
-<img src="C:\Users\jerry\AppData\Roaming\Typora\typora-user-images\image-20211116153437565.png" alt="image-20211116153437565" style="zoom:67%;" />
+<img src="../images/arm3.png" alt="image-20211116153437565" style="zoom:67%;" />
 
 
 
@@ -968,7 +968,7 @@ D1.10 Exception entry
 - ELR_ELx
   - For an exception taken to an Exception level using AArch64, the Exception Link Register for that Exception level, ELR_ELx, **holds the preferred exception return address**
 - 每個 EL 會有對應的 Vector Base Address Register (**VBAR**)，裡面存 exception base address for the table
-  - ![image-20211116155323176](C:\Users\jerry\AppData\Roaming\Typora\typora-user-images\image-20211116155323176.png)
+  - ![image-20211116155323176](../images/arm4.png)
   - <img src="https://hernan.de/assets/posts/super-hexagon-a-journey-from-el0-to-s-el3/vbar-levels.png" alt="VBAR Exception Types" style="zoom:50%;" />
   - Asynchronous exceptions
     - IRQ
@@ -977,7 +977,7 @@ D1.10 Exception entry
   - Synchronous exceptions
     - 指的就是 system call (SVC)
     - An **ESR_ELx** holds the syndrome information for an exception that is taken to AArch64 stat
-      - ![image-20211116160957404](C:\Users\jerry\AppData\Roaming\Typora\typora-user-images\image-20211116160957404.png)
+      - ![image-20211116160957404](../images/arm5.png)
   - register about exception
     - `ESR_ELn` - gives information about the reasons for the exception
     - `FAR_ELn` - holds the faulting virtual address for all synchronous instruction and Data Aborts and alignment faults
@@ -992,12 +992,12 @@ D1.10 Exception entry
 
 **TTBR_ELx**
 
-![image-20211116181850356](C:\Users\jerry\AppData\Roaming\Typora\typora-user-images\image-20211116181850356.png)
+![image-20211116181850356](../images/arm6.png)
 
 - D5.3.1 VMSAv8-64 translation table level -1, level 0, level 1, and level 2 descriptor formats
-  - ![image-20211116195816021](C:\Users\jerry\AppData\Roaming\Typora\typora-user-images\image-20211116195816021.png)
+  - ![image-20211116195816021](../images/arm7.png)
 - D5.3.2 Armv8 translation table level 3 descriptor formats
-  - ![image-20211116200602224](C:\Users\jerry\AppData\Roaming\Typora\typora-user-images\image-20211116200602224.png)
+  - ![image-20211116200602224](../images/arm8.png)
 
 皆是由末 2 bit 來決定 page type：
 
@@ -1008,7 +1008,7 @@ D1.10 Exception entry
 
 P. 2749
 
-![image-20211116200720569](C:\Users\jerry\AppData\Roaming\Typora\typora-user-images\image-20211116200720569.png)
+![image-20211116200720569](../images/arm9.png)
 
 - upper
   - `PBHA`: Page-based Hardware Attributes bits
