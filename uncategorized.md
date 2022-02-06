@@ -1410,7 +1410,7 @@ marked space / copied space
 
 
 
-#### CVE-2016-4622 analyze / exploit
+### CVE-2016-4622 analyze / exploit
 
 **環境**
 
@@ -1794,7 +1794,7 @@ Float64Array with some property due to our structure spraying before.
 
 
 
-#### CVE-2018-4233 (WebKit-RegEx-Exploit) analyze / isexploit
+### CVE-2018-4233 (WebKit-RegEx-Exploit) analyze / isexploit
 
 `addrof`：
 
@@ -3650,4 +3650,3 @@ gdb:
 ```
 
 最後在 `gdb` mode 有取得 shell，但是不知道為什麼直接跑 `./d8 ./pwn.js` 不會有 shell。
-
