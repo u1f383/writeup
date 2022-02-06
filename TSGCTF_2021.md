@@ -460,8 +460,6 @@ P.S. 關於 kernel 當中哪些 struct 可以利用，可以參考 ptr-yudai 的
 
 
 
-
-
 ### cling
 
 cling 為 C interpreter，而餵入的 C source **chal.c** 內提供以下功能

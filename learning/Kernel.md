@@ -2,11 +2,24 @@
 
 ### Reference
 
-[bsauce 一系列的文章](https://github.com/bsauce/kernel-security-learning)
+
+
 [yuawn 線上講解 2019_TokyoWesterns_CTF_Gnote](https://fb.watch/3ErU8pX3Jy/)
-[yuawn kernel-exploit 教學 repo](https://github.com/yuawn/kernel-exploitation)
+
+- [yuawn kernel-exploit 教學 repo](https://github.com/yuawn/kernel-exploitation)
+- Kernel pwn CTF 入門系列文章
+  - https://www.anquanke.com/post/id/255882
+  - https://www.anquanke.com/post/id/255883
+  - https://www.anquanke.com/post/id/25588ˋ
+- Learning Linux Kernel Exploitation 系列文章
+  - https://lkmidas.github.io/posts/20210123-linux-kernel-pwn-part-1/
+  - https://lkmidas.github.io/posts/20210128-linux-kernel-pwn-part-2/
+  - https://lkmidas.github.io/posts/20210205-linux-kernel-pwn-part-3/
 
 
+
+
+[bsauce 一系列的文章](https://github.com/bsauce/kernel-security-learning)
 
 ## kernel 環境
 
