@@ -285,7 +285,7 @@ LogFlowFunc(("\n"));
 
 int rc = hmR0VmxClearVmcs(pVmcsInfo); // 用 VMCLEAR 來初始化 VMCS 結構
 rc = hmR0VmxLoadVmcs(pVmcsInfo); // 以 pVmcsInfo->HCPhysVmcs 作為 VMCS pointer
-pVmcsInfo->pfnStartVM = VMXR0StartVM64;
+pVmcsInfo->pfnStartVM = VMXR0StartVM64; // 初始化 execution handler
 // 設置 pin-based VM-execution controls
 rc = hmR0VmxSetupVmcsPinCtls(pVCpu, pVmcsInfo);
 // 設置 processor-based VM-execution controls
@@ -303,6 +303,7 @@ hmR0VmxSetupVmcsXcptBitmap(pVCpu, pVmcsInfo);
 - `hmR0VmxLoadVmcs()` --> `VMXLoadVmcs()`，為 `VMPTRLD` handler
 - `pv` prefix 似乎是指 `void *` (pointer of void)
 - `pfn` 為 function pointer type
+- `VMXR0StartVM64()` - 在執行 guest code 時會呼叫到 `hmR0VmxRunGuest()`，而內部會呼叫此 function 來執行 VM，並且 vbox 只支援 64-bit 的 host (function suffix **64**)
 
 ```c
 if (RT_SUCCESS(rc))
@@ -638,6 +639,7 @@ for (;;)
 
 - `g_apfnVMExitHandlers[]` - 為一個 function table，根據 guest OS 執行 VMExit 回到 host OS 的原因 (`ExitReason`) 來執行對應的 handler (VMX_EXIT dispatch table)
 - `VINF_EM_RAW_INTERRUPT` - interrupt needed to be handled by the host OS，也就會跳出 guest OS
+- `cMaxResumeLoops` 預設為 1024，避免 guest os 佔滿 CPU 的使用時間
 
 ---
 
@@ -718,6 +720,29 @@ VMMRZCallRing3Enable(pVCpu); // re-enables host calls
 - FF 指的是 force flags，不太確定實際定義，不過猜測是能強制做出 flag 指定的行為，如 `VMCPU_FF_HM_UPDATE_CR3`
 - PAE - Physical Address Extension
 - PDPE - page directory pointer entry
+- `hmR0VmxExportGuestStateOptimal()` - 大部分 VMExit 的處理只需要更新 guest rip (`hmR0VmxExportGuestRip()`)，若有其他狀態更新就呼叫 `hmR0VmxExportGuestState()`
+  - `hmR0VmxExportGuestState()` - Exports the guest state into the VMCS guest-state area (VCPU --> VMCS)
+
+---
+
+觀念釐清
+
+- `pVCpu` 內有一個 member 為 `GstCtx`，直接對應到 VM 執行時的環境，在程式註解中被稱作 **guest context**
+  - 而 VM 執行時存放 guest context 的環境在註解中被稱作 **VMCS guest-state area**
+- host 中有些狀態也必須存放於 VMCS，註解中稱作 **host-state area in the VMCS**
+- ExportGuestState 指的是 `GstCtx` ---> VMCS 的 guest context，所以 import 就是 guest context --> `GstCtx`
+
+
+
+(From manual) The VMCS data are organized into six logical groups：
+
+- Guest-state area - Processor state is saved into the guest-state area on **VM exits** and **loaded from there on VM entries**
+- Host-state area - Processor state is **loaded from the host-state** area on VM exits
+  - 從 VM exit 回來時會載入，藉此恢復 host 的執行狀態
+- VM-execution control fields - These fields control processor behavior in VMX non-root operation. They determine in part the causes of VM exits
+- VM-exit control fields - These fields control VM exits
+- VM-entry control fields - These fields control VM entries
+- VM-exit information fields - These fields receive information on VM exits and describe the cause and the nature of VM exits. On some processors, these fields are read-only.
 
 ---
 
@@ -803,7 +828,7 @@ if (   (pVmcsInfo->u32ProcCtls2 & VMX_PROC_CTLS2_RDTSCP)
 
     // 因為呼叫該 function 時傳入 fUpdateHostMsr 為 true，因此就算執行過 hmR0VmxUpdateAutoLoadHostMsrs() 也沒關係
     int rc = hmR0VmxAddAutoLoadStoreMsr(pVCpu, pVmxTransient, MSR_K8_TSC_AUX, CPUMGetGuestTscAux(pVCpu), true, true);
-    // 要求 TSC_AUX MSR 在執行完 VMExit 後從 auto-load/store MSR 被移出 (?)
+    // 要求 TSC_AUX MSR 在執行完 VMExit 後從 auto-load/store MSR 被移出
     pVmxTransient->fRemoveTscAuxMsr = true;
 }
 ```
@@ -814,6 +839,821 @@ if (   (pVmcsInfo->u32ProcCtls2 & VMX_PROC_CTLS2_RDTSCP)
 
 `hmR0VmxRunGuest()` - Wrapper for running the guest code in VT-x
 
+```c
+PCPUMCTX pCtx = &pVCpu->cpum.GstCtx;
+// 標記 HM 為 guest-CPU registers 的持有者 (keeper)，在一些特定情況才會用到
+pCtx->fExtrn |= HMVMX_CPUMCTX_EXTRN_ALL | CPUMCTX_EXTRN_KEEPER_HM;
+
+PCVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+// 從 VMCS 取得 launch state 並看是否已經 launch
+bool const fResumeVM = RT_BOOL(pVmcsInfo->fVmcsState & VMX_V_VMCS_LAUNCH_STATE_LAUNCHED);
+PVMCC pVM = pVCpu->CTX_SUFF(pVM);
+int rc = pVmcsInfo->pfnStartVM(fResumeVM, pCtx, NULL /*pvUnused*/, pVM, pVCpu);
+return rc;
+```
+
+- `hmR0VmxSetupVmcs()` 時會初始化 `pfnStartVM` 成 `VMXR0StartVM64()`
+
 ---
 
 `hmR0VmxPostRunGuest()` - First C routine invoked after running guest code using hardware-assisted VMX
+
+```c
+uint64_t const uHostTsc = ASMReadTSC();
+
+// 在 HMInvalidatePageOnAllVCpus() 用來判斷是否要做 TLB flushing
+ASMAtomicWriteBool(&pVCpu->hm.s.fCheckedTLBFlush, false);
+// cWorldSwitchExits: World switch exit counter，用來做 EMT poking (?
+ASMAtomicIncU32(&pVCpu->hm.s.cWorldSwitchExits);
+// Exits/longjmps 到 r3 前會需要儲存 guest state
+pVCpu->hm.s.fCtxChanged            = 0;
+// 需要會從 VMCS 讀 transient 的資料
+pVmxTransient->fVmcsFieldsRead     = 0;
+// 在 NMI or interrupt 發生 page fault 而 VXExit
+pVmxTransient->fVectoringPF        = false;
+// 在 exception or page fault 時發生 page fault 而 VXExit
+pVmxTransient->fVectoringDoublePF  = false;
+
+PVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+if (!(pVmcsInfo->u32ProcCtls & VMX_PROC_CTLS_RDTSC_EXIT))
+{
+    uint64_t uGstTsc;
+    // host tsc + vmcs 內保存的 offset 等於目前 guest 內的 tsc
+    uGstTsc = uHostTsc + pVmcsInfo->u64TscOffset;
+    // 用 guest TSC 更新 TM
+    TMCpuTickSetLastSeen(pVCpu, uGstTsc);
+}
+
+// 通知 TM guest 已經停止
+TMNotifyEndOfExecution(pVCpu->CTX_SUFF(pVM), pVCpu);
+// 設置 STARTED，猜測代表機器已經啟動
+VMCPU_SET_STATE(pVCpu, VMCPUSTATE_STARTED_HM);
+
+// 一些 host state 會被 VMX 影響，因此需要 restore
+pVCpu->hm.s.vmx.fRestoreHostFlags |= VMX_RESTORE_HOST_REQUIRED;
+// 已經 launch，因此下次執行時用 VMRESUME 恢復執行狀態即可
+pVmcsInfo->fVmcsState |= VMX_V_VMCS_LAUNCH_STATE_LAUNCHED;
+// enable interrupt，舊的 fEFlags 的 IF 應該是 unset
+ASMSetFlags(pVmxTransient->fEFlags);
+```
+
+```c
+// 取得 VMExit 的 reason
+uint32_t uExitReason;
+int rc = VMXReadVmcs32(VMX_VMCS32_RO_EXIT_REASON, &uExitReason);
+// 32-bit value 中還有紀錄其他相關資訊
+pVmxTransient->uExitReason    = VMX_EXIT_REASON_BASIC(uExitReason);
+pVmxTransient->fVMEntryFailed = VMX_EXIT_REASON_HAS_ENTRY_FAILED(uExitReason);
+
+// 不需要 intercept RDTSCP 的話就會是 true
+if (pVmxTransient->fRemoveTscAuxMsr)
+{
+    hmR0VmxRemoveAutoLoadStoreMsr(pVCpu, pVmxTransient, MSR_K8_TSC_AUX);
+    pVmxTransient->fRemoveTscAuxMsr = false;
+}
+
+// 檢查 VMLAUNCH/VMRESUME 是否成功
+if (RT_LIKELY(rcVMRun == VINF_SUCCESS))
+{
+    // 更新 VM-exit history array 
+    EMHistoryAddExit(pVCpu, EMEXIT_MAKE_FT(EMEXIT_F_KIND_VMX, pVmxTransient->uExitReason & EMEXIT_F_TYPE_MASK), UINT64_MAX, uHostTsc);
+
+    if (RT_LIKELY(!pVmxTransient->fVMEntryFailed))
+    {
+        VMMRZCallRing3Enable(pVCpu); // re-enables host calls
+
+        // 在 re-entry 中 injecting event 會需要知道 guest-interruptibility，所以要在此 import
+        uint64_t const fImportMask = CPUMCTX_EXTRN_HM_VMX_INT_STATE;
+        // 保存 VMX 的 interruptibility 資訊到 guest state
+        rc = hmR0VmxImportGuestState(pVCpu, pVmcsInfo, fImportMask);
+
+        // 同步 VMCS 與 pVmxTransient 所紀錄的 TPR
+        if (   !pVmxTransient->fIsNestedGuest
+            && (pVmcsInfo->u32ProcCtls & VMX_PROC_CTLS_USE_TPR_SHADOW))
+        {
+            if (pVmxTransient->u8GuestTpr != pVmcsInfo->pbVirtApic[XAPIC_OFF_TPR])
+            {
+                rc = APICSetTpr(pVCpu, pVmcsInfo->pbVirtApic[XAPIC_OFF_TPR]);
+                ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_GUEST_APIC_TPR);
+            }
+        }
+        return;
+    }
+}
+... // error handling
+```
+
+- `hmR0VmxImportGuestState` -  從 VMX 讀取對應的值到 type 為 `PCPUMCTX` 的變數 `GstCtx` 當中 (cpum 應該是指 CPU in memory)
+  - `fExtrn` 紀錄著需要被 import 的 flag，macro 如 `CPUMCTX_EXTRN_RIP` 代表 flag
+
+---
+
+`VMXR0StartVM64()` - Prepares for and executes VMLAUNCH/VMRESUME
+
+```asm
+push    xBP
+mov     xBP, xSP
+
+pushf
+cli ; disable interrupt
+
+MYPUSHAD ; 保存所有 general purpose host registers
+
+; 在 vmlaunch64_done 寫入 return address 為 .vmlaunch64_done
+lea     r10, [.vmlaunch64_done wrt rip]
+mov     rax, VMX_VMCS_HOST_RIP
+vmwrite rax, r10
+
+; input 相關的 register
+; fResume already in rdi
+; pCtx    already in rsi
+mov     rbx, rdx        ; pvUnused
+
+; 如果需要的話 (fLoadSaveGuestXcr0 == 1) 保存 host 的 XCR0，並使用 guest 的
+mov     rax, r8                     ; pVCpu
+test    byte [xAX + VMCPU.hm + HMCPU.fLoadSaveGuestXcr0], 1
+jz      .xcr0_before_skip
+
+xor     ecx, ecx
+; xgetbv: Get Value of Extended Control Register
+xgetbv ; 把 host 的存到 stack
+push    xDX
+push    xAX
+
+; 載入 guest 的
+mov     eax, [xSI + CPUMCTX.aXcr]
+mov     edx, [xSI + CPUMCTX.aXcr + 4]
+xor     ecx, ecx
+xsetbv
+
+push    0 ; 需要 restore XCR0
+jmp     .xcr0_before_done
+
+.xcr0_before_skip:
+push    3fh ; 不需要 restore XCR0
+.xcr0_before_done:
+
+; Save segment registers
+MYPUSHSEGS xAX, ax
+
+; Save the pCtx pointer.
+push    xSI
+
+; Save host LDTR
+xor     eax, eax
+sldt    ax ; Store Local Descriptor Table Register
+push    xAX
+
+; Save host TR - task register
+str     eax ; Store Task Register
+push    xAX
+
+; Save host GDTR - Global Descriptor Table Register
+sub     xSP, xCB * 2
+sgdt    [xSP]
+
+; Save host IDTR - Interrupt Descriptor Table Register
+sub     xSP, xCB * 2
+sidt    [xSP]
+
+; Load CR2 if necessary
+; 因為 write cr2 是個 sync insn，所以 overhead 相較高 (expensive)
+mov     rbx, qword [xSI + CPUMCTX.cr2]
+mov     rdx, cr2
+cmp     rbx, rdx
+je      .skip_cr2_write
+mov     cr2, rbx
+
+.skip_cr2_write:
+mov     eax, VMX_VMCS_HOST_RSP
+vmwrite xAX, xSP
+
+; Fight intel spectre
+INDIRECT_BRANCH_PREDICTION_AND_L1_CACHE_BARRIER xSI, CPUMCTX_WSF_IBPB_ENTRY, CPUMCTX_WSF_L1D_ENTRY, CPUMCTX_WSF_MDS_ENTRY
+
+; 載入 guest general purpose registers
+mov     rax, qword [xSI + CPUMCTX.eax]
+...
+mov     rbp, qword [xSI + CPUMCTX.ebp]
+mov     r8,  qword [xSI + CPUMCTX.r8]
+...
+mov     r15, qword [xSI + CPUMCTX.r15]
+
+; Resume or start VM?
+cmp     xDI, 0 ; fResume == 0
+
+; Load guest rdi & rsi
+mov     rdi, qword [xSI + CPUMCTX.edi]
+mov     rsi, qword [xSI + CPUMCTX.esi]
+
+je      .vmlaunch64_launch ; 第一次載入
+
+vmresume ; resume VM
+jc      near .vmxstart64_invalid_vmcs_ptr
+jz      near .vmxstart64_start_failed
+jmp     .vmlaunch64_done;      ; here if vmresume detected a failure
+
+.vmlaunch64_launch:
+vmlaunch ; launch VM
+jc      near .vmxstart64_invalid_vmcs_ptr
+jz      near .vmxstart64_start_failed
+jmp     .vmlaunch64_done;      ; here if vmlaunch detected a failure
+
+ALIGNCODE(16)
+.vmlaunch64_done:
+RESTORE_STATE_VM64
+mov     eax, VINF_SUCCESS
+
+.vmstart64_end:
+popf
+pop     xBP
+ret
+; 發生 error 要回傳對應的 error status
+.vmxstart64_invalid_vmcs_ptr:
+RESTORE_STATE_VM64
+mov     eax, VERR_VMX_INVALID_VMCS_PTR_TO_START_VM
+jmp     .vmstart64_end
+
+.vmxstart64_start_failed:
+RESTORE_STATE_VM64
+mov     eax, VERR_VMX_UNABLE_TO_START_VM
+jmp     .vmstart64_end
+ENDPROC VMXR0StartVM64
+```
+
+- 似乎區分成 `ASM_CALL64_MSC` 以及 `ASM_CALL64_GCC`
+- 前面有 `x` prefix 的似乎是 extended register
+
+
+
+### 6
+
+> 大多 function 與狀態的保存相關，除此之外還有 VMExit handler 的分析
+
+---
+
+`hmR0VmxImportGuestState()` - Worker for VMXR0ImportStateOnDemand
+
+```c
+int      rc   = VINF_SUCCESS;
+PVMCC    pVM  = pVCpu->CTX_SUFF(pVM);
+PCPUMCTX pCtx = &pVCpu->cpum.GstCtx;
+uint32_t u32Val;
+
+// disable interrupt，使得 fExtrn modification 可以為 atomic 不被打斷
+RTCCUINTREG const fEFlags = ASMIntDisableFlags();
+
+fWhat &= pCtx->fExtrn; // what to import ?
+
+if (fWhat)
+{
+    do
+    {
+        // 省略如 if (fWhat & CPUMCTX_EXTRN_XXX) hmR0VmxImportGuestXXX(pVCpu) 的操作
+        ...
+    } while (0);
+    pCtx->fExtrn &= ~fWhat; // unset 那些 import 完的暫存器/資料
+    // 如果所有資料都被 import，則 unset HM 的 keeper bit
+    if (!(pCtx->fExtrn & HMVMX_CPUMCTX_EXTRN_ALL))
+        pCtx->fExtrn &= ~CPUMCTX_EXTRN_KEEPER_HM;
+}
+
+ASMSetFlags(fEFlags); // 重新 enable interrupt
+
+// maybe 執行到此的 scenario 參考下方補充 [1]
+if (VMMRZCallRing3IsEnabled(pVCpu))
+{
+    if (VMCPU_FF_IS_SET(pVCpu, VMCPU_FF_HM_UPDATE_CR3)) // force update cr3
+        PGMUpdateCR3(pVCpu, CPUMGetGuestCR3(pVCpu));
+
+    if (VMCPU_FF_IS_SET(pVCpu, VMCPU_FF_HM_UPDATE_PAE_PDPES)) // force update pdpe
+        PGMGstUpdatePaePdpes(pVCpu, &pVCpu->hm.s.aPdpes[0]);
+}
+```
+
+- 從 VMCS import 到 guest-CPU context
+- **[1]** - VM-exit -> `VMMRZCallRing3Enable()` -> do stuff that causes a longjmp -> `VMXR0CallRing3Callback()` -> `VMMRZCallRing3Disable()` -> `hmR0VmxImportGuestState()` -> Sets **VMCPU_FF_HM_UPDATE_CR3** pending -> return from the longjmp -> continue with VM-exit handling -> `hmR0VmxImportGuestState()`
+
+---
+
+`hmR0VmxExportGuestState()` - Exports the guest state into the VMCS guest-state area
+
+```c
+// 檢查是否在 real mode
+PVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+if (pVCpu->CTX_SUFF(pVM)->hm.s.vmx.fUnrestrictedGuest
+    || !CPUMIsGuestInRealModeEx(&pVCpu->cpum.GstCtx))
+    pVmcsInfo->RealMode.fRealOnV86Active = false;
+else
+    pVmcsInfo->RealMode.fRealOnV86Active = true;
+
+// 下方 export 的順序有 dependency
+int rc = hmR0VmxExportGuestEntryExitCtls(pVCpu, pVmxTransient);
+rc = hmR0VmxExportGuestCR0(pVCpu, pVmxTransient);
+VBOXSTRICTRC rcStrict = hmR0VmxExportGuestCR3AndCR4(pVCpu, pVmxTransient);
+rc = hmR0VmxExportGuestSegRegsXdtr(pVCpu, pVmxTransient);
+rc = hmR0VmxExportGuestMsrs(pVCpu, pVmxTransient);
+hmR0VmxExportGuestApicTpr(pVCpu, pVmxTransient);
+hmR0VmxExportGuestXcptIntercepts(pVCpu, pVmxTransient);
+hmR0VmxExportGuestRip(pVCpu);
+hmR0VmxExportGuestRsp(pVCpu);
+hmR0VmxExportGuestRflags(pVCpu, pVmxTransient);
+rc = hmR0VmxExportGuestHwvirtState(pVCpu, pVmxTransient);
+
+// 清除 "沒用 / 保留 / 無條件 export" 的 bits
+ASMAtomicUoAndU64(&pVCpu->hm.s.fCtxChanged, ~((HM_CHANGED_GUEST_GPRS_MASK & ~HM_CHANGED_GUEST_RSP) | ... | HM_CHANGED_GUEST_OTHER_MSRS | (HM_CHANGED_KEEPER_STATE_MASK & ~HM_CHANGED_VMX_MASK)));
+
+return rc;
+```
+
+---
+
+`hmR0VmxExportHostState()` - Exports the host state into the VMCS host-state area
+
+```c
+int rc = VINF_SUCCESS;
+if (pVCpu->hm.s.fCtxChanged & HM_CHANGED_HOST_CONTEXT)
+{
+    hmR0VmxExportHostControlRegs(); // 保存 host 的 control register
+    rc = hmR0VmxExportHostSegmentRegs(pVCpu); // 保存 host 的 segr
+    hmR0VmxExportHostMsrs(pVCpu); // 保存 host 的 msr
+    // 已經保存完畢，unset changed bit
+    pVCpu->hm.s.fCtxChanged &= ~HM_CHANGED_HOST_CONTEXT;
+}
+return rc;
+```
+
+- 沒有 `hmR0VmxImportHostState()` 也不需要
+
+---
+
+下面介紹在設置 VMCS 時初始化的 VMExit handler，大概可以劃分成以下流程：
+
+1. 當 CPU 執行到 VMExit 時，會將執行訊息保存在 VMCS 當中，之後再透過 `vmread` 讀 VMCS 並寫到 CPUMCTX 當中來儲存 guest OS 的狀態 (VMCS --> CPUMCTX)，同時取得 VMExit 的參數。其中 VMExit 回來的執行訊息可以分成以下 (參考 intel 手冊)：
+   - Basisc info： Exit reason / Exit qualification / Guest IP
+   - Event-specific info： interruption information / error code。當因為 exceptions / external interrupts / NMI 時發生所造成的 interrupt，就會紀錄相關資訊在此欄位
+   - Additional information： IDT-vectoring info /  error code，在處理 event 的過程中 trigger VMExit
+   - 執行特定 insn： VMExit instruction length / info，SMI (System Management Interrupt) 會額外有一些 IO 相關的資訊 (I/O RCX, I/O RSI, I/O RDI, I/O RIP)
+   - VM-instruction error： 不會提供 VMExit 相關的資訊，而是提供發生 non-faulting execution 時的一些執行狀態
+2. 執行對應的 VMExit handler
+3. 第二步成功的話會調整 register 並繼續執行 guest OS；若失敗則有些需要 inject exception 到 guest 當中，甚至要退出 VMX 回 R3 處理
+
+
+
+`hmR0VmxSetupVmcsPinCtls()` - Sets up pin-based VM-execution controls in the VMCS，跟 INTR / NMI 產生的 VMExit 較為相關 (async interrupt)
+
+```c
+PVMCC pVM = pVCpu->CTX_SUFF(pVM);
+// 在這邊的 set bit 必須一直要被 set
+uint32_t       fVal = pVM->hm.s.vmx.Msrs.PinCtls.n.allowed0;
+// 在這邊的 cleared bit 必須一直要被 cleared
+uint32_t const fZap = pVM->hm.s.vmx.Msrs.PinCtls.n.allowed1;
+
+// External interrupts 以及 Non-maskable interrupts
+fVal |= VMX_PIN_CTLS_EXT_INT_EXIT | VMX_PIN_CTLS_NMI_EXIT;
+
+// 如果開啟 virtual NMI，則使用 virt-NMIs 以及 virtual-NMI blocking features
+if (pVM->hm.s.vmx.Msrs.PinCtls.n.allowed1 & VMX_PIN_CTLS_VIRT_NMI)
+    fVal |= VMX_PIN_CTLS_VIRT_NMI;
+
+// 啟用 VMX-preemption timer
+if (pVM->hm.s.vmx.fUsePreemptTimer)
+    fVal |= VMX_PIN_CTLS_PREEMPT_TIMER;
+
+if ((fVal & fZap) != fVal) { ... /* error handling */ }
+
+/* Commit it to the VMCS and update our cache. */
+// commit 到 VMCS 當中，並且 update memory 當中的 VMCS
+int rc = VMXWriteVmcs32(VMX_VMCS32_CTRL_PIN_EXEC, fVal);
+pVmcsInfo->u32PinCtls = fVal;
+
+return VINF_SUCCESS;
+```
+
+- VMCS cache 應該是指存在於 memory 內的 `VMCSInfo` 結構
+
+---
+
+`hmR0VmxSetupVmcsProcCtls()` - Sets up processor-based VM-execution controls in the VMCS，例如執行到 instruction 時所觸發的 VMExit (sync interrupt)，不過還有另外分出 `hmR0VmxSetupVmcsProcCtls2()`
+
+```c
+PVMCC pVM = pVCpu->CTX_SUFF(pVM);
+uint32_t       fVal = pVM->hm.s.vmx.Msrs.ProcCtls.n.allowed0;
+uint32_t const fZap = pVM->hm.s.vmx.Msrs.ProcCtls.n.allowed1;
+
+fVal |= VMX_PROC_CTLS_HLT_EXIT /* HLT */ | VMX_PROC_CTLS_USE_TSC_OFFSETTING /* 使用 TSC-offsetting */ | VMX_PROC_CTLS_MOV_DR_EXIT /* MOV DRx */ | VMX_PROC_CTLS_UNCOND_IO_EXIT /* IO insn */ | VMX_PROC_CTLS_RDPMC_EXIT /* RDPMC */ | VMX_PROC_CTLS_MONITOR_EXIT /* MONITOR */ | VMX_PROC_CTLS_MWAIT_EXIT; /* MWAIT */
+
+// VMX_PROC_CTLS_MOV_DR_EXIT 需要被 toggle，不能 always set / cleared
+if (   !(pVM->hm.s.vmx.Msrs.ProcCtls.n.allowed1 & VMX_PROC_CTLS_MOV_DR_EXIT)
+    ||  (pVM->hm.s.vmx.Msrs.ProcCtls.n.allowed0 & VMX_PROC_CTLS_MOV_DR_EXIT))
+{ ... /* error handling */ }
+
+// mov cr3 / INVLPG (包含 INVPCID) 都會 trigger VMExit
+fVal |= VMX_PROC_CTLS_INVLPG_EXIT | VMX_PROC_CTLS_CR3_LOAD_EXIT |  VMX_PROC_CTLS_CR3_STORE_EXIT;
+
+// 如果 CPU support TPR shadowing 的話就用
+if (PDMHasApic(pVM)
+    && (pVM->hm.s.vmx.Msrs.ProcCtls.n.allowed1 & VMX_PROC_CTLS_USE_TPR_SHADOW))
+{
+    // CR8 reads from the Virtual-APIC page
+    fVal |= VMX_PROC_CTLS_USE_TPR_SHADOW;
+    // CR8 writes cause a VM-exit based on TPR threshold
+    Assert(!(fVal & VMX_PROC_CTLS_CR8_STORE_EXIT));
+    Assert(!(fVal & VMX_PROC_CTLS_CR8_LOAD_EXIT));
+    // TPR shadowing 的使用需要初始化 Virt APIC
+    hmR0VmxSetupVmcsVirtApicAddr(pVmcsInfo);
+}
+else
+{
+    // 有些 32-bit CPU 不支援 cr8 的存取，所以在 64-bit CPU 才去對 cr8 read/write 做處理
+    if (pVM->hm.s.fAllow64BitGuests)
+        fVal |= VMX_PROC_CTLS_CR8_STORE_EXIT | VMX_PROC_CTLS_CR8_LOAD_EXIT;
+}
+```
+
+- INVLPG - Invalidate TLB Entries
+- TPR shadow - 開啟後可以存取 CR8 會以 memory-mapped 的方式取得 APIC 的 TPR，如果沒開啟就只能用 MSR-based interfaces 存取 (?)
+
+```c
+// 如果 CPU 有用 MSR-bitmap 則 setup it
+if (pVM->hm.s.vmx.Msrs.ProcCtls.n.allowed1 & VMX_PROC_CTLS_USE_MSR_BITMAPS)
+{
+    fVal |= VMX_PROC_CTLS_USE_MSR_BITMAPS;
+    hmR0VmxSetupVmcsMsrBitmapAddr(pVmcsInfo);
+}
+
+// 如果 CPU 支援則 set secondary ProcCtls bit
+if (pVM->hm.s.vmx.Msrs.ProcCtls.n.allowed1 & VMX_PROC_CTLS_USE_SECONDARY_CTLS)
+    fVal |= VMX_PROC_CTLS_USE_SECONDARY_CTLS;
+
+// commit 到 VMCS 並更新 cache
+int rc = VMXWriteVmcs32(VMX_VMCS32_CTRL_PROC_EXEC, fVal);
+pVmcsInfo->u32ProcCtls = fVal;
+
+/* Set up MSR permissions that don't change through the lifetime of the VM. */
+if (pVmcsInfo->u32ProcCtls & VMX_PROC_CTLS_USE_MSR_BITMAPS)
+    hmR0VmxSetupVmcsMsrPermissions(pVCpu, pVmcsInfo);
+
+// 如果 CPU 支援則設置 secondary ProcCtls 結構
+if (pVmcsInfo->u32ProcCtls & VMX_PROC_CTLS_USE_SECONDARY_CTLS)
+    return hmR0VmxSetupVmcsProcCtls2(pVCpu, pVmcsInfo);
+
+// old cpu 不支援 secondary ProcCtls
+return VINF_SUCCESS;
+```
+
+---
+
+`hmR0VmxSetupVmcsProcCtls2()` - Sets up secondary processor-based VM-execution controls in the VMCS
+
+```c
+PVMCC pVM = pVCpu->CTX_SUFF(pVM);
+uint32_t       fVal = pVM->hm.s.vmx.Msrs.ProcCtls2.n.allowed0;
+uint32_t const fZap = pVM->hm.s.vmx.Msrs.ProcCtls2.n.allowed1;
+
+// WBINVD causes a VM-exit
+if (pVM->hm.s.vmx.Msrs.ProcCtls2.n.allowed1 & VMX_PROC_CTLS2_WBINVD_EXIT)
+    fVal |= VMX_PROC_CTLS2_WBINVD_EXIT;
+
+// 如果支援 INVPCID 就加到 VMExit handling 內，不支援的話執行就會處發 #UD
+if (   pVM->cpum.ro.GuestFeatures.fInvpcid
+    && (pVM->hm.s.vmx.Msrs.ProcCtls2.n.allowed1 & VMX_PROC_CTLS2_INVPCID))
+    fVal |= VMX_PROC_CTLS2_INVPCID;
+
+// Enable VPID
+if (pVM->hm.s.vmx.fVpid)
+    fVal |= VMX_PROC_CTLS2_VPID;
+
+// Enable unrestricted guest execution
+if (pVM->hm.s.vmx.fUnrestrictedGuest)
+    fVal |= VMX_PROC_CTLS2_UNRESTRICTED_GUEST;
+
+// 支援 Virtualize-APIC page 的存取，先前已經執行 hmR0VmxSetupVmcsVirtApicAddr() 來初始化 virt apic address
+if (pVM->hm.s.vmx.Msrs.ProcCtls2.n.allowed1 & VMX_PROC_CTLS2_VIRT_APIC_ACCESS)
+{
+    fVal |= VMX_PROC_CTLS2_VIRT_APIC_ACCESS;
+    hmR0VmxSetupVmcsApicAccessAddr(pVCpu);
+}
+
+// 如果支援 RDTSCP 就加到 VMExit handling 內，不支援的話執行就會處發 #UD
+if (   pVM->cpum.ro.GuestFeatures.fRdTscP
+    && (pVM->hm.s.vmx.Msrs.ProcCtls2.n.allowed1 & VMX_PROC_CTLS2_RDTSCP))
+    fVal |= VMX_PROC_CTLS2_RDTSCP;
+
+// 此時若 CPU 支援 ple (pause loop exiting)，會在發現 spinning 時做處理
+if (   (pVM->hm.s.vmx.Msrs.ProcCtls2.n.allowed1 & VMX_PROC_CTLS2_PAUSE_LOOP_EXIT)
+    && pVM->hm.s.vmx.cPleGapTicks
+    && pVM->hm.s.vmx.cPleWindowTicks)
+{
+    fVal |= VMX_PROC_CTLS2_PAUSE_LOOP_EXIT;
+
+    int rc = VMXWriteVmcs32(VMX_VMCS32_CTRL_PLE_GAP, pVM->hm.s.vmx.cPleGapTicks);
+    rc = VMXWriteVmcs32(VMX_VMCS32_CTRL_PLE_WINDOW, pVM->hm.s.vmx.cPleWindowTicks);
+}
+
+// commit to VMCS and update cache
+int rc = VMXWriteVmcs32(VMX_VMCS32_CTRL_PROC_EXEC2, fVal);
+pVmcsInfo->u32ProcCtls2 = fVal;
+
+return VINF_SUCCESS;
+```
+
+- INVPCID - Invalidate Process-Context Identifier
+- ple - VCPU1 嘗試執行 `pause` insn 來等 VCPU2 的 lock，而 VCPU2 卻在處理其他的行為，此時持續執行 `pause` 則會造成 CPU 浪費，因此 CPU 有一個功能可以偵測白白 pause-loop 的情況，並做出對應的處理，而在此會觸發 VMExit 讓 host 可以 handle
+- `fUnrestrictedGuest` 讓 guest 可以運行在沒有 paging 的 protection mode / real mode
+
+---
+
+`hmR0VmxSetupVmcsMiscCtls()` - Sets up misc control fields in the VMCS
+
+```c
+int rc = VMXWriteVmcs64(VMX_VMCS64_GUEST_VMCS_LINK_PTR_FULL, NIL_RTHCPHYS);
+// 設置 GuestMsrLoad/GuestMsrStore/HostMsrLoad 對應的 address
+// 其中 VMEntry 時會使用 GuestMsrLoad，VMExit 時會用 GuestMsrStore/HostMsrLoad
+rc = hmR0VmxSetupVmcsAutoLoadStoreMsrAddrs(pVmcsInfo);
+
+// 取出當前 VCPU 所紀錄的 cr0 mask 與 cr4 mask
+uint64_t const u64Cr0Mask = hmR0VmxGetFixedCr0Mask(pVCpu);
+uint64_t const u64Cr4Mask = hmR0VmxGetFixedCr4Mask(pVCpu);
+
+// 更新到 VMCS
+rc = VMXWriteVmcsNw(VMX_VMCS_CTRL_CR0_MASK, u64Cr0Mask);
+rc = VMXWriteVmcsNw(VMX_VMCS_CTRL_CR4_MASK, u64Cr4Mask);
+
+// 更新到 cache
+pVmcsInfo->u64Cr0Mask = u64Cr0Mask;
+pVmcsInfo->u64Cr4Mask = u64Cr4Mask;
+
+// 若 CPU 支援 Last Branch Record (LBR) 就開啟
+// 常在 Debug 時會用到，不過也不限於 debug
+if (pVCpu->CTX_SUFF(pVM)->hm.s.vmx.fLbr)
+    rc = VMXWriteVmcsNw(VMX_VMCS64_GUEST_DEBUGCTL_FULL, MSR_IA32_DEBUGCTL_LBR);
+return VINF_SUCCESS;
+```
+
+- `hmR0VmxSetupVmcsAutoLoadStoreMsrAddrs()` - Sets up the VM-entry MSR load, VM-exit MSR-store and VM-exit MSR-load addresses in the VMCS
+
+---
+
+`hmR0VmxSetupVmcsXcptBitmap()` - Sets up the initial exception bitmap in the VMCS based on static conditions，當部分 exception 發生時會被 intercept，也就是透過 VMExit 給 host 處理
+
+```c
+// 一些 exception 一定會被 intercept
+// #AC - Alignment Check，會有 side channel 以至於 leak host config
+// #DB - Debug，recursive #DB 可能會造成 CPU hang 住
+// #PF - Page Fault，需要跟 shadow page table 做同步
+uint32_t const uXcptBitmap = RT_BIT(X86_XCPT_AC)
+                            | RT_BIT(X86_XCPT_DB)
+                            | RT_BIT(X86_XCPT_PF);
+
+// commit to VMCS and update cache
+int rc = VMXWriteVmcs32(VMX_VMCS32_CTRL_EXCEPTION_BITMAP, uXcptBitmap);
+pVmcsInfo->u32XcptBitmap = uXcptBitmap;
+```
+
+- DR - Debug Register
+
+---
+
+`g_apfnVMExitHandlers[]` 為 VMExit handler table：
+
+```c
+/*  0  VMX_EXIT_XCPT_OR_NMI             */  hmR0VmxExitXcptOrNmi,
+/*  1  VMX_EXIT_EXT_INT                 */  hmR0VmxExitExtInt,
+/*  2  VMX_EXIT_TRIPLE_FAULT            */  hmR0VmxExitTripleFault,
+/*  3  VMX_EXIT_INIT_SIGNAL             */  hmR0VmxExitErrUnexpected,
+/*  4  VMX_EXIT_SIPI                    */  hmR0VmxExitErrUnexpected,
+/*  5  VMX_EXIT_IO_SMI                  */  hmR0VmxExitErrUnexpected,
+/*  6  VMX_EXIT_SMI                     */  hmR0VmxExitErrUnexpected,
+/*  7  VMX_EXIT_INT_WINDOW              */  hmR0VmxExitIntWindow,
+/*  8  VMX_EXIT_NMI_WINDOW              */  hmR0VmxExitNmiWindow,
+/*  9  VMX_EXIT_TASK_SWITCH             */  hmR0VmxExitTaskSwitch,
+/* 10  VMX_EXIT_CPUID                   */  hmR0VmxExitCpuid,
+/* 11  VMX_EXIT_GETSEC                  */  hmR0VmxExitGetsec,
+/* 12  VMX_EXIT_HLT                     */  hmR0VmxExitHlt,
+/* 13  VMX_EXIT_INVD                    */  hmR0VmxExitInvd,
+/* 14  VMX_EXIT_INVLPG                  */  hmR0VmxExitInvlpg,
+/* 15  VMX_EXIT_RDPMC                   */  hmR0VmxExitRdpmc,
+/* 16  VMX_EXIT_RDTSC                   */  hmR0VmxExitRdtsc,
+/* 17  VMX_EXIT_RSM                     */  hmR0VmxExitErrUnexpected,
+/* 18  VMX_EXIT_VMCALL                  */  hmR0VmxExitVmcall,
+/* 19  VMX_EXIT_VMCLEAR                 */  hmR0VmxExitSetPendingXcptUD,
+/* 20  VMX_EXIT_VMLAUNCH                */  hmR0VmxExitSetPendingXcptUD,
+/* 21  VMX_EXIT_VMPTRLD                 */  hmR0VmxExitSetPendingXcptUD,
+/* 22  VMX_EXIT_VMPTRST                 */  hmR0VmxExitSetPendingXcptUD,
+/* 23  VMX_EXIT_VMREAD                  */  hmR0VmxExitSetPendingXcptUD,
+/* 24  VMX_EXIT_VMRESUME                */  hmR0VmxExitSetPendingXcptUD,
+/* 25  VMX_EXIT_VMWRITE                 */  hmR0VmxExitSetPendingXcptUD,
+/* 26  VMX_EXIT_VMXOFF                  */  hmR0VmxExitSetPendingXcptUD,
+/* 27  VMX_EXIT_VMXON                   */  hmR0VmxExitSetPendingXcptUD,
+/* 28  VMX_EXIT_MOV_CRX                 */  hmR0VmxExitMovCRx,
+/* 29  VMX_EXIT_MOV_DRX                 */  hmR0VmxExitMovDRx,
+/* 30  VMX_EXIT_IO_INSTR                */  hmR0VmxExitIoInstr,
+/* 31  VMX_EXIT_RDMSR                   */  hmR0VmxExitRdmsr,
+/* 32  VMX_EXIT_WRMSR                   */  hmR0VmxExitWrmsr,
+/* 33  VMX_EXIT_ERR_INVALID_GUEST_STATE */  hmR0VmxExitErrInvalidGuestState,
+/* 34  VMX_EXIT_ERR_MSR_LOAD            */  hmR0VmxExitErrUnexpected,
+/* 35  UNDEFINED                        */  hmR0VmxExitErrUnexpected,
+/* 36  VMX_EXIT_MWAIT                   */  hmR0VmxExitMwait,
+/* 37  VMX_EXIT_MTF                     */  hmR0VmxExitMtf,
+/* 38  UNDEFINED                        */  hmR0VmxExitErrUnexpected,
+/* 39  VMX_EXIT_MONITOR                 */  hmR0VmxExitMonitor,
+/* 40  VMX_EXIT_PAUSE                   */  hmR0VmxExitPause,
+/* 41  VMX_EXIT_ERR_MACHINE_CHECK       */  hmR0VmxExitErrUnexpected,
+/* 42  UNDEFINED                        */  hmR0VmxExitErrUnexpected,
+/* 43  VMX_EXIT_TPR_BELOW_THRESHOLD     */  hmR0VmxExitTprBelowThreshold,
+/* 44  VMX_EXIT_APIC_ACCESS             */  hmR0VmxExitApicAccess,
+/* 45  VMX_EXIT_VIRTUALIZED_EOI         */  hmR0VmxExitErrUnexpected,
+/* 46  VMX_EXIT_GDTR_IDTR_ACCESS        */  hmR0VmxExitErrUnexpected,
+/* 47  VMX_EXIT_LDTR_TR_ACCESS          */  hmR0VmxExitErrUnexpected,
+/* 48  VMX_EXIT_EPT_VIOLATION           */  hmR0VmxExitEptViolation,
+/* 49  VMX_EXIT_EPT_MISCONFIG           */  hmR0VmxExitEptMisconfig,
+/* 50  VMX_EXIT_INVEPT                  */  hmR0VmxExitSetPendingXcptUD,
+/* 51  VMX_EXIT_RDTSCP                  */  hmR0VmxExitRdtscp,
+/* 52  VMX_EXIT_PREEMPT_TIMER           */  hmR0VmxExitPreemptTimer,
+/* 53  VMX_EXIT_INVVPID                 */  hmR0VmxExitSetPendingXcptUD,
+/* 54  VMX_EXIT_WBINVD                  */  hmR0VmxExitWbinvd,
+/* 55  VMX_EXIT_XSETBV                  */  hmR0VmxExitXsetbv,
+/* 56  VMX_EXIT_APIC_WRITE              */  hmR0VmxExitErrUnexpected,
+/* 57  VMX_EXIT_RDRAND                  */  hmR0VmxExitErrUnexpected,
+/* 58  VMX_EXIT_INVPCID                 */  hmR0VmxExitInvpcid,
+/* 59  VMX_EXIT_VMFUNC                  */  hmR0VmxExitErrUnexpected,
+/* 60  VMX_EXIT_ENCLS                   */  hmR0VmxExitErrUnexpected,
+/* 61  VMX_EXIT_RDSEED                  */  hmR0VmxExitErrUnexpected,
+/* 62  VMX_EXIT_PML_FULL                */  hmR0VmxExitErrUnexpected,
+/* 63  VMX_EXIT_XSAVES                  */  hmR0VmxExitErrUnexpected,
+/* 64  VMX_EXIT_XRSTORS                 */  hmR0VmxExitErrUnexpected,
+/* 65  UNDEFINED                        */  hmR0VmxExitErrUnexpected,
+/* 66  VMX_EXIT_SPP_EVENT               */  hmR0VmxExitErrUnexpected,
+/* 67  VMX_EXIT_UMWAIT                  */  hmR0VmxExitErrUnexpected,
+/* 68  VMX_EXIT_TPAUSE                  */  hmR0VmxExitErrUnexpected,
+```
+
+---
+
+`hmR0VmxExitExtInt()` - VM-exit handler for external interrupts (**VMX_EXIT_EXT_INT**)
+
+```c
+... // 對於 windows 的處理
+return VINF_EM_RAW_INTERRUPT;
+```
+
+---
+
+`hmR0VmxExitXcptOrNmi()` - VM-exit handler for exceptions or NMIs (**VMX_EXIT_XCPT_OR_NMI**)
+
+```c
+// 從 VMX 讀 interruption-info 到 pVmxTransient
+hmR0VmxReadExitIntInfoVmcs(pVmxTransient);
+
+uint32_t const uExitIntType = VMX_EXIT_INT_INFO_TYPE(pVmxTransient->uExitIntInfo);
+uint8_t const  uVector      = VMX_EXIT_INT_INFO_VECTOR(pVmxTransient->uExitIntInfo);
+
+PCVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+VBOXSTRICTRC rcStrict;
+switch (uExitIntType)
+{
+    // guest 的 NMI 只能是 host 自己 inject，並且 host inject 到 guest 的 event 都不會觸發 VMExit
+    case VMX_EXIT_INT_INFO_TYPE_NMI:
+    {
+        // 配送 NMI 給 host
+        rcStrict = hmR0VmxExitHostNmi(pVCpu, pVmcsInfo);
+        break;
+    }
+
+    // Privileged software exceptions, e.g. #DB
+    case VMX_EXIT_INT_INFO_TYPE_PRIV_SW_XCPT:
+        RT_FALL_THRU();
+    // Software exceptions, e.g. #BP #OF
+    case VMX_EXIT_INT_INFO_TYPE_SW_XCPT:
+        RT_FALL_THRU();
+    // Hardware exceptions，處理後恢復 guest 執行
+    case VMX_EXIT_INT_INFO_TYPE_HW_XCPT:
+    {
+        hmR0VmxReadExitIntErrorCodeVmcs(pVmxTransient);
+        hmR0VmxReadExitInstrLenVmcs(pVmxTransient);
+        hmR0VmxReadIdtVectoringInfoVmcs(pVmxTransient);
+        hmR0VmxReadIdtVectoringErrorCodeVmcs(pVmxTransient);
+
+        rcStrict = hmR0VmxExitXcpt(pVCpu, pVmxTransient);
+        break;
+    }
+
+    default: { ... /* error handle */ }
+}
+
+return rcStrict;
+```
+
+---
+
+`hmR0VmxExitHostNmi()` - Dispatching an NMI on the host CPU that received it
+
+```c
+RTCPUID const idCpu = pVmcsInfo->idHostCpuExec;
+
+bool fDispatched = false;
+RTCCUINTREG const fEFlags = ASMIntDisableFlags(); // disable interrupt
+if (idCpu == RTMpCpuId()) // VM 使用的 host CPU 跟目前一樣
+{
+    VMXDispatchHostNmi(); // 透過 int 2 來傳送 NMI
+    fDispatched = true;
+}
+ASMSetFlags(fEFlags); // enable interrupt
+if (fDispatched)
+    return VINF_SUCCESS;
+
+// RTMpOnSpecific() 會等到 worker function (hmR0DispatchHostNmi) 在 target CPU 上執行
+return RTMpOnSpecific(idCpu, &hmR0DispatchHostNmi, NULL, NULL);
+```
+
+- IDT[2] 對到的是 NMI pin，傳送給 NMI handler 做執行
+- 原始碼的註解中有提到：執行到這邊後就不在延後 NMI 的 dispatching
+
+---
+
+`hmR0VmxExitXcpt()` - VM-exit exception handler for all exceptions (except NMIs!)，內部並不是實際在處理每個種類的 exception，而是在判斷 exception 的種類後呼叫對應的 function 處理
+
+```c
+// VMExit 是在 delivering event 時發生
+VBOXSTRICTRC rcStrict = hmR0VmxCheckExitDueToEventDelivery(pVCpu, pVmxTransient);
+if (rcStrict == VINF_SUCCESS)
+{
+	// optional event 可能需要 reinject 到 guest 內
+    // 不過 page fault 比較複雜，在 hmR0VmxExitXcptPF() 中有額外做其他處理
+    uint8_t const uVector = VMX_EXIT_INT_INFO_VECTOR(pVmxTransient->uExitIntInfo);
+    if (   !pVCpu->hm.s.Event.fPending
+        || uVector == X86_XCPT_PF)
+    {
+        switch (uVector)
+        {
+            case X86_XCPT_PF: return hmR0VmxExitXcptPF(pVCpu, pVmxTransient);
+            case X86_XCPT_GP: return hmR0VmxExitXcptGP(pVCpu, pVmxTransient);
+            case X86_XCPT_MF: return hmR0VmxExitXcptMF(pVCpu, pVmxTransient);
+            case X86_XCPT_DB: return hmR0VmxExitXcptDB(pVCpu, pVmxTransient);
+            case X86_XCPT_BP: return hmR0VmxExitXcptBP(pVCpu, pVmxTransient);
+            case X86_XCPT_AC: return hmR0VmxExitXcptAC(pVCpu, pVmxTransient);
+            default:
+                return hmR0VmxExitXcptOthers(pVCpu, pVmxTransient);
+        }
+    }
+}
+else if (rcStrict == VINF_HM_DOUBLE_FAULT)
+{
+    // 先前處理後會重新 inject event 給 guest，確定有 event 正在 pending 即可
+    Assert(pVCpu->hm.s.Event.fPending);
+    rcStrict = VINF_SUCCESS;
+}
+
+return rcStrict;
+```
+
+---
+
+`hmR0VmxExitXcptPF()` - VM-exit exception handler for \#PF (Page-fault exception)
+
+```c
+```
+
+---
+
+`hmR0VmxExitXcptGP()` - VM-exit exception handler for \#GP (General-protection exception)
+
+```c
+```
+
+---
+
+`hmR0VmxExitXcptMF()` - VM-exit exception handler for \#MF (Math Fault: floating point exception)
+
+```c
+```
+
+---
+
+`hmR0VmxExitXcptDB()` - VM-exit exception handler for \#DB (Debug exception)
+
+```c
+```
+
+---
+
+`hmR0VmxExitXcptBP()` - VM-exit exception handler for \#BP (Breakpoint exception)
+
+```c
+```
+
+---
+
+`hmR0VmxExitXcptAC()` - VM-exit exception handler for \#AC (Alignment-check exception)
+
+```c
+```
+
+---
+
+`hmR0VmxExitXcptOthers()` - VM-exit exception handler wrapper for all other exceptions that are not handled by a specific handler
+
+```c
+```
+
