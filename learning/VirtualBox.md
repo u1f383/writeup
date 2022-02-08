@@ -1,7 +1,3 @@
-[notion link](https://www.notion.so/Virtualbox-694abab61a5c4a19aec48671bf747069)
-
-
-
 ## README
 
 ### binary overview
@@ -1594,6 +1590,7 @@ if (rcStrict == VINF_SUCCESS)
             case X86_XCPT_BP: return hmR0VmxExitXcptBP(pVCpu, pVmxTransient);
             case X86_XCPT_AC: return hmR0VmxExitXcptAC(pVCpu, pVmxTransient);
             default:
+                // 非以上的 interrupt 都會 reinject to guest
                 return hmR0VmxExitXcptOthers(pVCpu, pVmxTransient);
         }
     }
@@ -1613,34 +1610,225 @@ return rcStrict;
 `hmR0VmxExitXcptPF()` - VM-exit exception handler for \#PF (Page-fault exception)
 
 ```c
+HMVMX_VALIDATE_EXIT_XCPT_HANDLER_PARAMS(pVCpu, pVmxTransient);
+PVMCC pVM = pVCpu->CTX_SUFF(pVM);
+hmR0VmxReadExitQualVmcs(pVmxTransient);
+
+/* If it's a vectoring #PF, emulate injecting the original event injection as PGMTrap0eHandler() is incapable
+    of differentiating between instruction emulation and event injection that caused a #PF. See @bugref{6607}. */
+// PGMTrap0eHandler() 沒辦法分辨造成 PG 的是 insn emulation 還是 event injection，
+// 因此在此模擬原本的 event 去 imject event
+if (pVmxTransient->fVectoringPF)
+{
+    // 確定 flag 有紀錄 event 正在 pending
+    Assert(pVCpu->hm.s.Event.fPending);
+    return VINF_EM_RAW_INJECT_TRPM_EVENT;
+}
+
+PCPUMCTX pCtx = &pVCpu->cpum.GstCtx;
+int rc = hmR0VmxImportGuestState(pVCpu, pVmxTransient->pVmcsInfo, HMVMX_CPUMCTX_EXTRN_ALL);
+
+TRPMAssertXcptPF(...); // Assert a page-fault exception
 ```
+
+- Vectoring #PF - VM-exit 是因為 page fault 在 external interrupt or NMI delivery 時發生
+- VINF_EM_RAW_INJECT_TRPM_EVENT - Inject a TRPM event
+  - TRPM - Trap Manager
+
+```c
+// #PF handler
+rc = PGMTrap0eHandler(pVCpu, pVmxTransient->uExitIntErrorCode, CPUMCTX2CORE(pCtx), (RTGCPTR)pVmxTransient->uExitQual);
+// 通常是 shadow page table sync 或者 MMIO instruction
+if (rc == VINF_SUCCESS)
+{
+    ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_ALL_GUEST);
+    TRPMResetTrap(pVCpu);
+    return rc;
+}
+
+if (rc == VINF_EM_RAW_GUEST_TRAP) // 沒辦法 handle guest trap，轉給 REM 執行
+{
+    // guest page fault，需要反映給 guest
+    if (!pVmxTransient->fVectoringDoublePF)
+    {
+		// 取得 error code
+        uint32_t const uGstErrorCode = TRPMGetErrorCode(pVCpu);
+        // 清除當前的 active trap/exception/interrupt
+        TRPMResetTrap(pVCpu);
+        pVCpu->hm.s.Event.fPending = false;
+        // inject 一個 event 給 guest
+        hmR0VmxSetPendingEvent(pVCpu, VMX_ENTRY_INT_INFO_FROM_EXIT_INT_INFO(pVmxTransient->uExitIntInfo), 0, uGstErrorCode, pVmxTransient->uExitQual);
+    }
+    else
+    {
+        // double fault (page fault in delivery of page fault), so inject DF
+        TRPMResetTrap(pVCpu);
+		// 清除當前的 PF
+        pVCpu->hm.s.Event.fPending = false;
+        // replace PF to DF
+        hmR0VmxSetPendingXcptDF(pVCpu);
+    }
+    return VINF_SUCCESS;
+}
+
+// 清除當前的 active trap/exception/interrupt，代表處理完畢
+TRPMResetTrap(pVCpu);
+return rc;
+```
+
+- RC short for ???? (maybe return code)
+- REM - Recompiled Execution Monitor
+- 如果發生 double fault，則會送 #DF event 給 guest
+- `PGMTrap0eHandler()` - host 會先透過 page manager and monitor 處理，如果需要特別處理才會進入下面的 if-else
 
 ---
 
 `hmR0VmxExitXcptGP()` - VM-exit exception handler for \#GP (General-protection exception)
 
 ```c
+HMVMX_VALIDATE_EXIT_XCPT_HANDLER_PARAMS(pVCpu, pVmxTransient);
+
+PCPUMCTX     pCtx      = &pVCpu->cpum.GstCtx;
+PVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+
+if (pVmcsInfo->RealMode.fRealOnV86Active) // real mode
+{ /* likely */ }
+else
+{
+    // 如果 guest 不在 real-mode 或是有 unrestricted guest execution support，就反應 #GP 給 guest
+    int rc = hmR0VmxImportGuestState(pVCpu, pVmcsInfo, HMVMX_CPUMCTX_EXTRN_ALL);
+    hmR0VmxSetPendingEvent(pVCpu, VMX_ENTRY_INT_INFO_FROM_EXIT_INT_INFO(pVmxTransient->uExitIntInfo), pVmxTransient->cbExitInstr, pVmxTransient->uExitIntErrorCode, 0);
+    return rc;
+}
+
+int rc = hmR0VmxImportGuestState(pVCpu, pVmcsInfo, HMVMX_CPUMCTX_EXTRN_ALL);
+// 執行一行 instruction，但是透過 IEM (Instruction Decoding and Emulation) 跑
+VBOXSTRICTRC rcStrict = IEMExecOne(pVCpu);
+if (rcStrict == VINF_SUCCESS)
+{
+    if (!CPUMIsGuestInRealModeEx(pCtx)) // 執行完不在 real-mode
+    {
+        // 如果可以繼續透過 VMX 執行的話就繼續 (VMX)，否則就只能用 IEM
+        pVmcsInfo->RealMode.fRealOnV86Active = false;
+        if (HMCanExecuteVmxGuest(pVCpu->pVMR0, pVCpu, pCtx))
+            ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_ALL_GUEST);
+        else
+            rcStrict = VINF_EM_RESCHEDULE; // VM 需要被 rescheduling
+    }
+    else // 
+        ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_ALL_GUEST);
+}
+else if (rcStrict == VINF_IEM_RAISED_XCPT) // 出現 exception，不過展開等同於 VINF_EM_RESCHEDULE
+{
+    rcStrict = VINF_SUCCESS;
+    ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_RAISED_XCPT_MASK);
+}
+return VBOXSTRICTRC_VAL(rcStrict);
 ```
+
+- **NOTE**: guest OS 本身也有 exception/interrupt handler 等等，而當發生 VMExit 時會先到 host 處理，之後若 inject event 到 guest 當中代表呼叫 guest 內的對應 handler 即可
+- 模式切換後需要檢查是否能透過 VMX 繼續執行，否則就用模擬的 (IEM)
 
 ---
 
 `hmR0VmxExitXcptMF()` - VM-exit exception handler for \#MF (Math Fault: floating point exception)
 
 ```c
+// 從 VMCS import 到 guest context
+int rc = hmR0VmxImportGuestState(pVCpu, pVmxTransient->pVmcsInfo, CPUMCTX_EXTRN_CR0);
+
+// NE - Numeric error
+if (!(pVCpu->cpum.GstCtx.cr0 & X86_CR0_NE))
+{
+    // 將 #MF 轉為 FERR
+    rc = PDMIsaSetIrq(pVCpu->CTX_SUFF(pVM), 13, 1, 0 /* uTagSrc */);
+    int rc2 = hmR0VmxAdvanceGuestRip(pVCpu, pVmxTransient);
+    return rc;
+}
+
+hmR0VmxSetPendingEvent(...); // 似乎就送 inject event 到 guest 就好
+return VINF_SUCCESS;
 ```
+
+- `PDMIsaSetIrq()` - Sets the pending interrupt coming from ISA source or HPET
 
 ---
 
 `hmR0VmxExitXcptDB()` - VM-exit exception handler for \#DB (Debug exception)
 
 ```c
+// 從 Exit qualification 取得 DR6 並傳給 DBGF
+hmR0VmxReadExitQualVmcs(pVmxTransient);
+uint64_t const uDR6 = X86_DR6_INIT_VAL | (pVmxTransient->uExitQual & (  X86_DR6_B0 | X86_DR6_B1 | X86_DR6_B2 | X86_DR6_B3 | X86_DR6_BD | X86_DR6_BS));
+
+int rc;
+PCPUMCTX pCtx = &pVCpu->cpum.GstCtx;
+// 先給 host 處理
+rc = DBGFRZTrap01Handler(pVCpu->CTX_SUFF(pVM), pVCpu, CPUMCTX2CORE(pCtx), uDR6, pVCpu->hm.s.fSingleInstruction);
+
+// 避免執行兩次相同的 insn，確保為 single stepping
+if (rc == VINF_EM_DBG_STEPPED && (pVmxTransient->pVmcsInfo->u32ProcCtls & VMX_PROC_CTLS_MONITOR_TRAP_FLAG))
+	rc = VINF_EM_RAW_GUEST_TRAP;
+
+if (rc == VINF_EM_RAW_GUEST_TRAP) // guest trap
+{
+    // 更新 DR6, DR7 以及 LBR
+    VMMRZCallRing3Disable(pVCpu);
+    HM_DISABLE_PREEMPT(pVCpu);
+
+    pCtx->dr[6] &= ~X86_DR6_B_MASK;
+    pCtx->dr[6] |= uDR6;
+    if (CPUMIsGuestDebugStateActive(pVCpu))
+        ASMSetDR6(pCtx->dr[6]);
+
+    HM_RESTORE_PREEMPT();
+    VMMRZCallRing3Enable(pVCpu);
+
+    rc = hmR0VmxImportGuestState(pVCpu, pVmxTransient->pVmcsInfo, CPUMCTX_EXTRN_DR7);
+
+	// 更新 DR7，不過對 debugging 沒有很了解，不確定這邊的行為
+    pCtx->dr[7] &= ~(uint64_t)X86_DR7_GD;
+    pCtx->dr[7] &= ~(uint64_t)X86_DR7_RAZ_MASK;
+    pCtx->dr[7] |= X86_DR7_RA1_MASK;
+
+    rc = VMXWriteVmcsNw(VMX_VMCS_GUEST_DR7, pCtx->dr[7]);
+
+    // 註解說明透過 VMExit 回傳的資訊來對 guest 送 #DB，會比呼叫 hmR0VmxSetPendingXcptDB() 好，因為有些並非 regular #DB
+    hmR0VmxSetPendingEvent(pVCpu, VMX_ENTRY_INT_INFO_FROM_EXIT_INT_INFO(pVmxTransient->uExitIntInfo), pVmxTransient->cbExitInstr, pVmxTransient->uExitIntErrorCode, 0);
+    return VINF_SUCCESS;
+}
+
+// 並非 guest trap 而是 hypervisor 相關的 debug event
+// 猜測為 host 正在 debugging
+AssertMsg(rc == VINF_EM_DBG_STEPPED || rc == VINF_EM_DBG_BREAKPOINT, ("%Rrc\n", rc));
+// 單純設置 VCPU 的 Hyper dr6 即可
+CPUMSetHyperDR6(pVCpu, uDR6);
+
+return rc;
 ```
+
+- `DBGFRZTrap01Handler()` - 給 host 處理 debug 相關的 trap 的 function
+- `VINF_EM_RAW_GUEST_TRAP` - 直接 reinject event 給 guest 處理
+- REM (Recompiled Execution Monitor) 提供 CPU insn 的 software emulation
+- Hyper (`CPUMHYPERCTX`)- The hypervisor context CPU state (just DRx left now)
 
 ---
 
 `hmR0VmxExitXcptBP()` - VM-exit exception handler for \#BP (Breakpoint exception)
 
 ```c
+int rc = hmR0VmxImportGuestState(pVCpu, pVmxTransient->pVmcsInfo, HMVMX_CPUMCTX_EXTRN_ALL);
+
+// 先透過 DBGFRZTrap03Handler() 處理
+rc = DBGFRZTrap03Handler(pVCpu->CTX_SUFF(pVM), pVCpu, CPUMCTX2CORE(&pVCpu->cpum.GstCtx));
+
+if (rc == VINF_EM_RAW_GUEST_TRAP) // 如果種類為 raw guest trap，則由 guest 自行處理
+{
+    // inject guest pending event
+    hmR0VmxSetPendingEvent(pVCpu, VMX_ENTRY_INT_INFO_FROM_EXIT_INT_INFO(pVmxTransient->uExitIntInfo), pVmxTransient->cbExitInstr, pVmxTransient->uExitIntErrorCode, 0);
+    rc = VINF_SUCCESS;
+}
+return rc;
 ```
 
 ---
@@ -1648,12 +1836,428 @@ return rcStrict;
 `hmR0VmxExitXcptAC()` - VM-exit exception handler for \#AC (Alignment-check exception)
 
 ```c
+// 透過 host 開啟 split-lock detection 偵測到 #AC
+int rc = hmR0VmxImportGuestState(pVCpu, pVmxTransient->pVmcsInfo,
+                                    CPUMCTX_EXTRN_CR0 | CPUMCTX_EXTRN_RFLAGS | CPUMCTX_EXTRN_SS | CPUMCTX_EXTRN_CS);
+
+// 判斷 split-lock 的依據有三種:
+// 1. Alignment check 為 disable
+// 2. #AC 發生在 0~2
+// 3. EFLAGS.AC != 0
+// 此 if-else 用來 handle split lock
+if (!(pVCpu->cpum.GstCtx.cr0 & X86_CR0_AM) || CPUMGetGuestCPL(pVCpu) != 3 || !(pVCpu->cpum.GstCtx.eflags.u & X86_EFL_AC) )
+{
+    // 檢查 debug/trace 的 event
+    PVMCC pVM = pVCpu->pVMR0; // pointer to vm r0
+    
+    // 但是 split-lock event 為 disable，並且 VMX split lock 也沒開
+    if (   !DBGF_IS_EVENT_ENABLED(pVM, DBGFEVENT_VMX_SPLIT_LOCK)
+        && !VBOXVMM_VMX_SPLIT_LOCK_ENABLED())
+    {
+        if (pVM->cCpus == 1) // 只有一個 CPU
+            // potentially wrong，需要 sync 一下 state
+            rc = hmR0VmxImportGuestState(pVCpu, pVmxTransient->pVmcsInfo, HMVMX_CPUMCTX_EXTRN_ALL);
+    }
+    else
+    {
+        rc = hmR0VmxImportGuestState(pVCpu, pVmxTransient->pVmcsInfo, HMVMX_CPUMCTX_EXTRN_ALL);
+
+        // undefined macro
+        VBOXVMM_XCPT_DF(pVCpu, &pVCpu->cpum.GstCtx);
+
+        if (DBGF_IS_EVENT_ENABLED(pVM, DBGFEVENT_VMX_SPLIT_LOCK))
+        {
+            // raise debug event
+            VBOXSTRICTRC rcStrict = DBGFEventGenericWithArgs(pVM, pVCpu, DBGFEVENT_VMX_SPLIT_LOCK, DBGFEVENTCTX_HM, 0);
+            if (rcStrict != VINF_SUCCESS)
+                return rcStrict;
+        }
+    }
+    ...
+}
+...
+```
+
+- split-lock - a **low-level memory-bus** lock taken by the processor for a memory range that crosses a cache line，而一個 split lock insn 需要消耗 1000 clock cycles
+  - 實際上 split lock 為一種 misaligned memory access，並且影響的是整個系統的執行速度
+  - 較近期的 intel 會在 CPU 嘗試執行 split lock 時產生 trap，讓 user 決定是否繼續執行
+  - 更多資訊可以看 lwn.net 上的 [Developers split over split-lock detection](https://lwn.net/Articles/806466/)
+- `DBGFEventGenericWithArgs()` - Raises a generic debug event if enabled and not being ignored
+- DBGF - Debugger Facility
+
+```c
+{
+    ...
+    if (pVM->cCpus == 1) // 只有一個 VCPU
+    {
+	    // 模擬 insn，並且 ignore lock prefix 
+        VBOXSTRICTRC rcStrict = IEMExecOneIgnoreLock(pVCpu);
+        if (rcStrict == VINF_SUCCESS)
+            ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_ALL_GUEST);
+        else if (rcStrict == VINF_IEM_RAISED_XCPT)
+        {
+            ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_RAISED_XCPT_MASK);
+            rcStrict = VINF_SUCCESS;
+        }
+        return rcStrict;
+    }
+    return VINF_EM_EMULATE_SPLIT_LOCK; // 請求 REM emulation
+}
+
+// reinject dbg event，並且到此時不會有 nested 的 case
+hmR0VmxSetPendingEvent(pVCpu, VMX_ENTRY_INT_INFO_FROM_EXIT_INT_INFO(pVmxTransient->uExitIntInfo), pVmxTransient->cbExitInstr, pVmxTransient->uExitIntErrorCode, 0);
+return VINF_SUCCESS;
+```
+
+- VINF_EM_EMULATE_SPLIT_LOCK - Emulate split-lock access on SMP
+
+---
+
+`hmR0VmxExitXcptOthers()` - VM-exit exception handler wrapper for all other exceptions that are not handled by a specific handler，不過此 function 只簡單的 re-injects the exception 到 VM 當中
+
+```c
+PCVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+
+// 嘗試 reinject 此 exception 給 guest，而此 exception 不能為 double fault
+uint8_t const uVector = VMX_EXIT_INT_INFO_VECTOR(pVmxTransient->uExitIntInfo);
+
+#ifdef HMVMX_ALWAYS_TRAP_ALL_XCPTS
+int rc = hmR0VmxImportGuestState(pVCpu, pVmxTransient->pVmcsInfo, CPUMCTX_EXTRN_CS | CPUMCTX_EXTRN_RIP);
+#endif
+
+// reinject original exception into VM
+hmR0VmxSetPendingEvent(pVCpu, VMX_ENTRY_INT_INFO_FROM_EXIT_INT_INFO(pVmxTransient->uExitIntInfo), pVmxTransient->cbExitInstr, pVmxTransient->uExitIntErrorCode, 0);
+return VINF_SUCCESS;
+```
+
+- `VMX_EXIT_INT_INFO_IS_XCPT_PF()` - 檢測是否為 page fault
+
+---
+
+`hmR0VmxExitIntWindow()` - VM-exit handler for interrupt-window exiting (VMX_EXIT_INT_WINDOW)
+
+```c
+// 代表 guest 已經準備好要接收 interrupt，不需要在執行 VMExit
+PVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+hmR0VmxClearIntWindowExitVmcs(pVmcsInfo);
+return VINF_SUCCESS;
 ```
 
 ---
 
-`hmR0VmxExitXcptOthers()` - VM-exit exception handler wrapper for all other exceptions that are not handled by a specific handler
+`hmR0VmxClearIntWindowExitVmcs()` - Clears the interrupt-window exiting control in the VMCS
+
+```c
+if (pVmcsInfo->u32ProcCtls & VMX_PROC_CTLS_INT_WINDOW_EXIT)
+{
+    pVmcsInfo->u32ProcCtls &= ~VMX_PROC_CTLS_INT_WINDOW_EXIT; // unset
+    // 更新到 VMCS
+    int rc = VMXWriteVmcs32(VMX_VMCS32_CTRL_PROC_EXEC, pVmcsInfo->u32ProcCtls);
+}
+```
+
+- `u32ProcCtls` 紀錄與 Processor-based VM-execution controls 相關的屬性
+
+---
+
+`hmR0VmxExitGetsec()` - VM-exit handler for **GETSEC** (VMX_EXIT_GETSEC). Unconditional VM-exit
+
+```c
+PVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+int rc = hmR0VmxImportGuestState(pVCpu, pVmcsInfo, CPUMCTX_EXTRN_CR4);
+
+if (pVCpu->cpum.GstCtx.cr4 & X86_CR4_SMXE) // 需要 SMXE enabled
+    return VINF_EM_RAW_EMULATE_INSTR; // 回傳給 host 來模擬
+
+... // return expected error
+```
+
+- Safer Mode Extensions (SMX) 相關的功能可以透過 GETSEC 系列的 instruction 來存取
+
+---
+
+`hmR0VmxExitRdtsc()` - VM-exit handler for RDTSC (VMX_EXIT_RDTSC). Conditional VM-exit
+
+```c
+PVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+// 從 VMCS 讀 exit insn 的長度
+hmR0VmxReadExitInstrLenVmcs(pVmxTransient);
+int rc = hmR0VmxImportGuestState(pVCpu, pVmcsInfo, IEM_CPUMCTX_EXTRN_MUST_MASK);
+
+// 模擬執行 Rdtsc insn
+VBOXSTRICTRC rcStrict = IEMExecDecodedRdtsc(pVCpu, pVmxTransient->cbExitInstr);
+if (RT_LIKELY(rcStrict == VINF_SUCCESS))
+{
+    // 當 tsc offsetting 開啟而得到 VMExit 時，需要 reset offsetting
+    if (pVmcsInfo->u32ProcCtls & VMX_PROC_CTLS_USE_TSC_OFFSETTING)
+        pVmxTransient->fUpdatedTscOffsettingAndPreemptTimer = false;
+    // 需要更新 guest rip / rflags
+    ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_GUEST_RIP | HM_CHANGED_GUEST_RFLAGS);
+}
+else if (rcStrict == VINF_IEM_RAISED_XCPT) // rescheduled
+{
+    // 如果模擬執行失敗，inject 一個 exception
+    ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_RAISED_XCPT_MASK);
+    rcStrict = VINF_SUCCESS;
+}
+return rcStrict;
+```
+
+- `IEMExecDecodedRdtsc()` - Interface for HM and EM to emulate the `RDTSC` instruction
+
+---
+
+`hmR0VmxExitRdtscp()` - VM-exit handler for RDTSCP (VMX_EXIT_RDTSCP). Conditional VM-exit，基本上與 `hmR0VmxExitRdtsc()` 相同，只差在模擬時執行的是 `IEMExecDecodedRdtscp()`
+
+```c
+PVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+hmR0VmxReadExitInstrLenVmcs(pVmxTransient);
+int rc = hmR0VmxImportGuestState(pVCpu, pVmcsInfo, IEM_CPUMCTX_EXTRN_MUST_MASK | CPUMCTX_EXTRN_TSC_AUX);
+
+VBOXSTRICTRC rcStrict = IEMExecDecodedRdtscp(pVCpu, pVmxTransient->cbExitInstr);
+if (RT_LIKELY(rcStrict == VINF_SUCCESS))
+{
+    if (pVmcsInfo->u32ProcCtls & VMX_PROC_CTLS_USE_TSC_OFFSETTING)
+        pVmxTransient->fUpdatedTscOffsettingAndPreemptTimer = false;
+    ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_GUEST_RIP | HM_CHANGED_GUEST_RFLAGS);
+}
+else if (rcStrict == VINF_IEM_RAISED_XCPT)
+{
+    ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_RAISED_XCPT_MASK);
+    rcStrict = VINF_SUCCESS;
+}
+return rcStrict;
+```
+
+---
+
+`hmR0VmxExitRdpmc()` - VM-exit handler for RDPMC (VMX_EXIT_RDPMC). Conditional VM-exit
+
+```c
+PVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+int rc = hmR0VmxImportGuestState(pVCpu, pVmcsInfo, CPUMCTX_EXTRN_CR4 | CPUMCTX_EXTRN_CR0 | CPUMCTX_EXTRN_RFLAGS | CPUMCTX_EXTRN_SS);
+
+PCPUMCTX pCtx = &pVCpu->cpum.GstCtx;
+// Interpret RDPMC
+rc = EMInterpretRdpmc(pVCpu->CTX_SUFF(pVM), pVCpu, CPUMCTX2CORE(pCtx));
+if (RT_LIKELY(rc == VINF_SUCCESS))
+    // 如果模擬執行成功，更新 guest rip
+    rc = hmR0VmxAdvanceGuestRip(pVCpu, pVmxTransient);
+else
+    rc = VERR_EM_INTERPRETER;
+return rc;
+```
+
+- rdpmc - Read Performance-Monitoring Counters
+
+---
+
+`hmR0VmxExitVmcall()` - VM-exit handler for VMCALL (VMX_EXIT_VMCALL). Unconditional VM-exit
+
+```c
+VBOXSTRICTRC rcStrict = VERR_VMX_IPE_3;
+// 檢查是否可以呼叫 hypercall (VMMCALL & VMCALL)
+if (EMAreHypercallInstructionsEnabled(pVCpu))
+{
+    PVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+    int rc = hmR0VmxImportGuestState(pVCpu, pVmcsInfo, CPUMCTX_EXTRN_RIP | CPUMCTX_EXTRN_RFLAGS | CPUMCTX_EXTRN_CR0 | CPUMCTX_EXTRN_SS  | CPUMCTX_EXTRN_CS | CPUMCTX_EXTRN_EFER);
+
+    // 執行 hypercall
+    rcStrict = GIMHypercall(pVCpu, &pVCpu->cpum.GstCtx);
+    if (rcStrict == VINF_SUCCESS)
+        // 成功就更新 rip
+        rc = hmR0VmxAdvanceGuestRip(pVCpu, pVmxTransient);
+    else
+        // 代表要回到 r3 去執行 hypercall
+        Assert(   rcStrict == VINF_GIM_R3_HYPERCALL
+                || rcStrict == VINF_GIM_HYPERCALL_CONTINUING
+                || RT_FAILURE(rcStrict));
+}
+
+// 如果 hypercall disable 或是 failed，就送 #UD
+if (RT_FAILURE(rcStrict))
+{
+    hmR0VmxSetPendingXcptUD(pVCpu);
+    rcStrict = VINF_SUCCESS;
+}
+
+return rcStrict;
+```
+
+- hypercall 透過 GIM (Guest Interface Manager) 來呼叫
+- VINF_GIM_R3_HYPERCALL - Return to ring-3 to perform the hypercall there
+
+---
+
+`hmR0VmxExitInvlpg()` - VM-exit handler for INVLPG (VMX_EXIT_INVLPG). Conditional VM-exit
+
+```c
+PVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+// 從 VMCS 更新 qual 以及 exit insn len
+hmR0VmxReadExitQualVmcs(pVmxTransient);
+hmR0VmxReadExitInstrLenVmcs(pVmxTransient);
+int rc = hmR0VmxImportGuestState(pVCpu, pVmcsInfo, IEM_CPUMCTX_EXTRN_EXEC_DECODED_MEM_MASK);
+
+// 模擬執行 Invlpg
+VBOXSTRICTRC rcStrict = IEMExecDecodedInvlpg(pVCpu, pVmxTransient->cbExitInstr, pVmxTransient->uExitQual);
+
+if (rcStrict == VINF_SUCCESS || rcStrict == VINF_PGM_SYNC_CR3)
+    // 更新 rip 與 rflags
+    ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_GUEST_RIP | HM_CHANGED_GUEST_RFLAGS);
+else if (rcStrict == VINF_IEM_RAISED_XCPT)
+{
+    ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_RAISED_XCPT_MASK);
+    rcStrict = VINF_SUCCESS;
+}
+return rcStrict;
+```
+
+- INVLPG - Invalidate TLB Entries
+- VINF_PGM_SYNC_CR3 - The urge to syncing CR3
+
+---
+
+`hmR0VmxExitHlt()` - VM-exit handler for HLT (VMX_EXIT_HLT). Conditional VM-exit，handle `hlt` instruction
+
+```c
+// update rip
+int rc = hmR0VmxAdvanceGuestRip(pVCpu, pVmxTransient);
+// 檢查是否在 hlt 後需要繼續執行
+if (EMShouldContinueAfterHalt(pVCpu, &pVCpu->cpum.GstCtx))
+    rc = VINF_SUCCESS;
+else
+    rc = VINF_EM_HALT;
+return rc;
+```
+
+---
+
+`hmR0VmxExitPreemptTimer()` - VM-exit handler for expiry of the VMX-preemption timer，timer 過期
+
+```c
+/* If the VMX-preemption timer has expired, reinitialize the preemption timer on next VM-entry. */
+// 如果 VMX-preemption timer 過期，在下次重新初始化
+pVmxTransient->fUpdatedTscOffsettingAndPreemptTimer = false;
+
+/* If there are any timer events pending, fall back to ring-3, otherwise resume guest execution. */
+
+PVMCC pVM = pVCpu->CTX_SUFF(pVM);
+// 如果有 timer events 在 pending，有的話就回傳 VINF_EM_RAW_TIMER_PENDING
+bool fTimersPending = TMTimerPollBool(pVM, pVCpu);
+return fTimersPending ? VINF_EM_RAW_TIMER_PENDING : VINF_SUCCESS;
+```
+
+- VINF_EM_RAW_TIMER_PENDING - 回到 ring3 在做處理
+
+---
+
+`hmR0VmxExitXsetbv()` - VM-exit handler for XSETBV (VMX_EXIT_XSETBV). Unconditional VM-exit
+
+```c
+PVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+// 讀 exit insn len
+hmR0VmxReadExitInstrLenVmcs(pVmxTransient);
+int rc = hmR0VmxImportGuestState(pVCpu, pVmcsInfo, IEM_CPUMCTX_EXTRN_MUST_MASK | CPUMCTX_EXTRN_CR4);
+
+// 模擬執行 ISETBV
+VBOXSTRICTRC rcStrict = IEMExecDecodedXsetbv(pVCpu, pVmxTransient->cbExitInstr);
+ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, rcStrict != VINF_IEM_RAISED_XCPT ? HM_CHANGED_GUEST_RIP | HM_CHANGED_GUEST_RFLAGS : HM_CHANGED_RAISED_XCPT_MASK);
+
+PCCPUMCTX pCtx = &pVCpu->cpum.GstCtx;
+// 當 XCR0 需要在進入 VM 前後保存時就要 set
+pVCpu->hm.s.fLoadSaveGuestXcr0 = (pCtx->cr4 & X86_CR4_OSXSAVE) && pCtx->aXcr[0] != ASMGetXcr0();
+
+return rcStrict;
+```
+
+- `IEMExecDecodedXsetbv()` - Interface for HM and EM to emulate the `XSETBV` instruction (loads XCRx)
+- XSETBV - Set Extended Control Register
+- X86_CR4_OSXSAVE - XSAVE and Processor Extended States Enable
+  - XSAVE - Save Processor Extended States
+
+---
+
+後續還有許多類似操作的 VMExit handler，在 host 模擬某個 insn 的執行，並根據結果判斷是否要回 guest os 自己處理，就不一一贅述，選擇一些比較特別的介紹。
+
+
+
+`hmR0VmxExitIoInstr()` - VM-exit handler for I/O instructions (VMX_EXIT_IO_INSTR). Conditional VM-exit
+
+```c
+PCPUMCTX pCtx = &pVCpu->cpum.GstCtx;
+PVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+hmR0VmxReadExitQualVmcs(pVmxTransient);
+hmR0VmxReadExitInstrLenVmcs(pVmxTransient);
+int rc = hmR0VmxImportGuestState(pVCpu, pVmcsInfo, IEM_CPUMCTX_EXTRN_MUST_MASK | CPUMCTX_EXTRN_SREG_MASK | CPUMCTX_EXTRN_EFER);
+
+// 參考 intel spec. 27-5 "Exit Qualifications for I/O Instructions" 所定的結構
+uint32_t const uIOPort      = VMX_EXIT_QUAL_IO_PORT(pVmxTransient->uExitQual);
+uint8_t  const uIOSize      = VMX_EXIT_QUAL_IO_SIZE(pVmxTransient->uExitQual);
+bool     const fIOWrite     = (VMX_EXIT_QUAL_IO_DIRECTION(pVmxTransient->uExitQual) == VMX_EXIT_QUAL_IO_DIRECTION_OUT);
+bool     const fIOString    = VMX_EXIT_QUAL_IO_IS_STRING(pVmxTransient->uExitQual);
+bool     const fGstStepping = RT_BOOL(pCtx->eflags.Bits.u1TF);
+bool     const fDbgStepping = pVCpu->hm.s.fSingleInstruction;
+
+// 更新 exit history
+VBOXSTRICTRC rcStrict;
+PCEMEXITREC  pExitRec = NULL;
+if (   !fGstStepping
+    && !fDbgStepping)
+    pExitRec = EMHistoryUpdateFlagsAndTypeAndPC(pVCpu, ...);
+```
+
+- `EMEXITREC` - Accumulative exit record
+
+```c
+if (!pExitRec)
+{
+	
+}
+```
+
+
+
+---
+
+`hmR0VmxExitTaskSwitch()` - VM-exit handler for task switches (VMX_EXIT_TASK_SWITCH). Unconditional VM-exit
+
+
+
+---
+
+`hmR0VmxExitEptMisconfig()` - VM-exit handler for EPT misconfiguration (VMX_EXIT_EPT_MISCONFIG). Conditional VM-exit
+
+```c
+
+```
+
+---
+
+`hmR0VmxExitEptViolation()` - VM-exit handler for EPT violation (VMX_EXIT_EPT_VIOLATION). Conditional VM-exit
 
 ```c
 ```
+
+---
+
+`hmR0VmxInjectEventVmcs()` - Injects an event into the guest upon VM-entry by updating the relevant fields in the VM-entry area in the VMCS，透過此 function 能送 guest 一個 interrupt event (inject)，通常會需要以下資訊：
+
+- interrupt info
+- exception error code
+- cr2
+
+```
+```
+
+
+
+
+
+而一些 VMExit handler 會呼叫 `hmR0VmxSetPendingEvent()` 來送 event 給 guest，在執行 `hmR0VmxPreRunGuest()` 準備進 VM 時，會呼叫 `hmR0VmxInjectPendingEvent()` --> `hmR0VmxInjectEventVmcs()` 來 inject 這些 exception
+
+
+
+## 7
+
+
 
