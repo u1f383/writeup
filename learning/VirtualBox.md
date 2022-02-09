@@ -2209,33 +2209,247 @@ if (   !fGstStepping
 - `EMEXITREC` - Accumulative exit record
 
 ```c
-if (!pExitRec)
+if (!pExitRec) // pExitRec (Pointer to an exit record) 為空
 {
-	
+    // I/O accesses 的大小
+	static uint32_t const s_aIOSizes[4] = { 1, 2, 0, 4 };
+    // 將 return value 存放在 rax/eax/ax 的 AND masks
+    static uint32_t const s_aIOOpAnd[4] = { 0xff, 0xffff, 0, 0xffffffff };
+
+    uint32_t const cbValue  = s_aIOSizes[uIOSize];
+    uint32_t const cbInstr  = pVmxTransient->cbExitInstr;
+    bool  fUpdateRipAlready = false;
+    PVMCC pVM = pVCpu->CTX_SUFF(pVM);
+	// 如果是 String IO operation (INS / OUTS) 的話
+    if (fIOString)
+    {
+        bool const fInsOutsInfo = RT_BF_GET(pVM->hm.s.vmx.Msrs.u64Basic, VMX_BF_BASIC_VMCS_INS_OUTS);
+        // 可以的話用 instruction-information，否則就 interpret 此 insn
+        if (fInsOutsInfo) // 成功取得 info
+        {
+            hmR0VmxReadExitInstrInfoVmcs(pVmxTransient);
+            // 取得 addr 大小： 0=16-bit, 1=32-bit, 2=64-bit
+            IEMMODE const enmAddrMode = (IEMMODE)pVmxTransient->ExitInstrInfo.StrIo.u3AddrSize;
+            // 是否為 Repeated IO operation
+            bool const fRep = VMX_EXIT_QUAL_IO_IS_REP(pVmxTransient->uExitQual);
+            if (fIOWrite) // 模擬執行 write
+                rcStrict = IEMExecStringIoWrite(pVCpu, cbValue, enmAddrMode, fRep, cbInstr, pVmxTransient->ExitInstrInfo.StrIo.iSegReg, true);
+            else // 模擬執行 read
+                rcStrict = IEMExecStringIoRead(pVCpu, cbValue, enmAddrMode, fRep, cbInstr, true);
+            }
+        }
+        else
+            rcStrict = IEMExecOne(pVCpu); // 只能 interpret 模擬執行
+
+        ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_GUEST_RIP);
+        fUpdateRipAlready = true; // 已經在執行時更新 rip
+    }
+    else // 一般的 IO operation
+    {
+        uint32_t const uAndVal = s_aIOOpAnd[uIOSize];
+        if (fIOWrite) // write
+        {
+            rcStrict = IOMIOPortWrite(pVM, pVCpu, uIOPort, pCtx->eax & uAndVal, cbValue);
+            // TF - Trap flag
+            if (rcStrict == VINF_IOM_R3_IOPORT_WRITE && !pCtx->eflags.Bits.u1TF)
+                // 離開 VMX 並且在 r3 處理此 IO operation
+                rcStrict = EMRZSetPendingIoPortWrite(pVCpu, uIOPort, cbInstr, cbValue, pCtx->eax & uAndVal);
+        }
+        else // read (in)
+        {
+            uint32_t u32Result = 0;
+            
+            rcStrict = IOMIOPortRead(pVM, pVCpu, uIOPort, &u32Result, cbValue);
+            if (IOM_SUCCESS(rcStrict))
+                // 儲存 IN insn 的回傳值到 AL/AX/EAX
+                pCtx->eax = (pCtx->eax & ~uAndVal) | (u32Result & uAndVal);
+            if (rcStrict == VINF_IOM_R3_IOPORT_READ && !pCtx->eflags.Bits.u1TF)
+                rcStrict = EMRZSetPendingIoPortRead(pVCpu, uIOPort, cbInstr, cbValue);
+        }
+    }
+	...
 }
 ```
 
+- `IEMExecStringIoWrite()` - Interface for HM and EM for executing string I/O OUT (write) instructions
+  - IN (read) 則是 `IEMExecStringIoRead()` 
+  - IEM - Interpreted execution manager
+- IOM - in/out monitor
+- 分成 IOString 以及普通的 IO，如果為普通 IO，在執行完後會檢查是否要回到 r3 處理 (`VINF_IOM_R3_IOPORT_READ` 以及 `VINF_IOM_R3_IOPORT_WRITE`)，舉例來說 device emulation 需要在 r3 模擬
 
+```c
+if (!pExitRec)
+{
+    ...
+    if (IOM_SUCCESS(rcStrict))
+    {
+        if (!fUpdateRipAlready) // 如果操作中沒有更新 rip，現在更新
+        {
+            hmR0VmxAdvanceGuestRipBy(pVCpu, cbInstr);
+            ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_GUEST_RIP);
+        }
+
+        // 如果是有 rep prefix 的 ins/outs，需要更新 rflags
+        if (fIOString)
+            ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_GUEST_RFLAGS);
+
+        rc = hmR0VmxImportGuestState(pVCpu, pVmcsInfo, CPUMCTX_EXTRN_DR7);
+
+        // 如果有 IO breakpoint，需要檢查是否被 trigger，有的話作出對應的回覆
+        uint32_t const uDr7 = pCtx->dr[7];
+        // DE 為 Debugging Extensions
+        if (RT_UNLIKELY(((uDr7 & X86_DR7_ENABLED_MASK) && X86_DR7_ANY_RW_IO(uDr7) && (pCtx->cr4 & X86_CR4_DE)) || DBGFBpIsHwIoArmed(pVM)))
+        {
+            // 在 host CPU 當中處理 debugging，避免 preempt 發生
+            // 也需要 disable r3 call，避免 longjump
+            VMMRZCallRing3Disable(pVCpu);
+            HM_DISABLE_PREEMPT(pVCpu);
+
+            // 保存 guest DRx state
+            bool fIsGuestDbgActive = CPUMR0DebugStateMaybeSaveGuest(pVCpu, true /* fDr6 */);
+            // 檢查 guest 或 hypervisor breakpoints 的 I/O access
+            VBOXSTRICTRC rcStrict2 = DBGFBpCheckIo(pVM, pVCpu, pCtx, uIOPort, cbValue);
+            if (rcStrict2 == VINF_EM_RAW_GUEST_TRAP)
+            {
+                // guest raw trap --> inject #DB event 給 guest 處理
+                if (fIsGuestDbgActive)
+                    ASMSetDR6(pCtx->dr[6]);
+                if (pCtx->dr[7] != uDr7)
+                    pVCpu->hm.s.fCtxChanged |= HM_CHANGED_GUEST_DR7;
+
+                hmR0VmxSetPendingXcptDB(pVCpu);
+            }
+            else if (rcStrict2 != VINF_SUCCESS && (rcStrict == VINF_SUCCESS || rcStrict2 < rcStrict))
+                rcStrict = rcStrict2;
+
+            // 恢復 preempt / longjump
+            HM_RESTORE_PREEMPT();
+            VMMRZCallRing3Enable(pVCpu);
+        }
+    }
+    ...
+}
+```
+
+- `VMMRZCallRing3Disable()` - 能 disable host call 來避免 r3 的 longjump，實際上把 VCPU 當中用於記錄 ring3 call counter 的 `cCallRing3Disabled` 做加減 1 來 disable/enable 而已
+  - Call Ring-3 - Formerly known as host calls，看起來是作用於 guest，不過不確定具體行為
+
+```c
+if (!pExitRec) { ... /* 上方的程式碼 */ }
+else // 有 exit record
+{
+    // 透過 EMHistoryExec() 即可
+    int rc2 = hmR0VmxImportGuestState(pVCpu, pVmcsInfo, HMVMX_CPUMCTX_EXTRN_ALL);
+    rcStrict = EMHistoryExec(pVCpu, pExitRec, 0);
+    ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_ALL_GUEST);
+}
+return rcStrict;
+```
 
 ---
 
 `hmR0VmxExitTaskSwitch()` - VM-exit handler for task switches (VMX_EXIT_TASK_SWITCH). Unconditional VM-exit
 
+```c
+/* Check if this task-switch occurred while delivery an event through the guest IDT. */
+// 檢查 task-switch 是否在 delivery event 發生時透過 IDT 執行
+hmR0VmxReadExitQualVmcs(pVmxTransient);
+if (VMX_EXIT_QUAL_TASK_SWITCH_TYPE(pVmxTransient->uExitQual) == VMX_EXIT_QUAL_TASK_SWITCH_TYPE_IDT)
+{
+    hmR0VmxReadIdtVectoringInfoVmcs(pVmxTransient); // 讀取 vectoring IDT
+    if (VMX_IDT_VECTORING_INFO_IS_VALID(pVmxTransient->uIdtVectoringInfo))
+    {
+        uint32_t uErrCode;
+        // 取得 error code
+        if (VMX_IDT_VECTORING_INFO_IS_ERROR_CODE_VALID(pVmxTransient->uIdtVectoringInfo))
+        {
+            hmR0VmxReadIdtVectoringErrorCodeVmcs(pVmxTransient);
+            uErrCode = pVmxTransient->uIdtVectoringErrorCode;
+        }
+        else
+            uErrCode = 0;
 
+        RTGCUINTPTR GCPtrFaultAddress;
+        // 取得 fault address
+        if (VMX_IDT_VECTORING_INFO_IS_XCPT_PF(pVmxTransient->uIdtVectoringInfo))
+            GCPtrFaultAddress = pVCpu->cpum.GstCtx.cr2;
+        else
+            GCPtrFaultAddress = 0;
+
+        hmR0VmxReadExitInstrLenVmcs(pVmxTransient);
+        // 給 guest 自行處理
+        hmR0VmxSetPendingEvent(pVCpu, VMX_ENTRY_INT_INFO_FROM_EXIT_IDT_INFO(pVmxTransient->uIdtVectoringInfo), pVmxTransient->cbExitInstr, uErrCode, GCPtrFaultAddress);
+        // Inject a TRPM event
+        return VINF_EM_RAW_INJECT_TRPM_EVENT;
+    }
+}
+
+// 註解表示需要透過 interpreter 來模擬 task-switch，但 VERR_EM_INTERPRETER 的註解卻說 interpreter 無法 emulate (?)
+return VERR_EM_INTERPRETER;
+```
+
+- VMX_EXIT_QUAL_TASK_SWITCH_TYPE_IDT - Task switch caused by an interrupt gate
+- Vectoring 代表正在處理的 interrupt
 
 ---
 
 `hmR0VmxExitEptMisconfig()` - VM-exit handler for EPT misconfiguration (VMX_EXIT_EPT_MISCONFIG). Conditional VM-exit
 
-```c
-
-```
+- 舉例來說，guest 存取 physical address 時，如果 EPT table 沒有對應的 host address，就會觸發此異常
+- 首先會透過 `EMHistoryUpdateFlagsAndTypeAndPC()` 嘗試將 engine specific exit 轉成 generic one
+  - 回傳 pointer 時用 `EMHistoryExec()` 處理此 special action
+  - 回傳 NULL 時代表用 normal exit action 處理即可，後續程式碼透過  `PGMR0Trap0eHandlerNPMisconfig()` 處理
 
 ---
 
-`hmR0VmxExitEptViolation()` - VM-exit handler for EPT violation (VMX_EXIT_EPT_VIOLATION). Conditional VM-exit
+`hmR0VmxExitEptViolation()` - VM-exit handler for EPT violation (VMX_EXIT_EPT_VIOLATION). Conditional VM-exit，EPT 內有 3 bit 表示 page perm，如果權限錯誤就會 trigger EPT violation
 
 ```c
+HMVMX_VALIDATE_EXIT_HANDLER_PARAMS(pVCpu, pVmxTransient);
+Assert(pVCpu->CTX_SUFF(pVM)->hm.s.fNestedPaging);
+
+... // 從 VMCS 讀一些狀態更新到 pVmxTransient
+
+// VMExit 發生在 event delivery
+VBOXSTRICTRC rcStrict = hmR0VmxCheckExitDueToEventDelivery(pVCpu, pVmxTransient);
+if (RT_LIKELY(rcStrict == VINF_SUCCESS))
+{
+    // delivery event 時發生 EPT violation，需要解析一開始的 #PF，然後 reinject 原本的事件
+}
+else { ... /* other error */ }
+
+PVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+hmR0VmxReadGuestPhysicalAddrVmcs(pVmxTransient);
+int rc = hmR0VmxImportGuestState(pVCpu, pVmcsInfo, IEM_CPUMCTX_EXTRN_MUST_MASK);
+AssertRCReturn(rc, rc);
+
+RTGCPHYS const GCPhys    = pVmxTransient->uGuestPhysicalAddr;
+uint64_t const uExitQual = pVmxTransient->uExitQual;
+
+RTGCUINT uErrorCode = 0;
+if (uExitQual & VMX_EXIT_QUAL_EPT_INSTR_FETCH)
+    uErrorCode |= X86_TRAP_PF_ID;
+if (uExitQual & VMX_EXIT_QUAL_EPT_DATA_WRITE)
+    uErrorCode |= X86_TRAP_PF_RW;
+if (uExitQual & VMX_EXIT_QUAL_EPT_ENTRY_PRESENT)
+    uErrorCode |= X86_TRAP_PF_P;
+
+PVMCC    pVM  = pVCpu->CTX_SUFF(pVM);
+PCPUMCTX pCtx = &pVCpu->cpum.GstCtx;
+
+// 雖然是 assert，但是有更新 trpm，感覺也是做 inject event
+TRPMAssertXcptPF(pVCpu, GCPhys, uErrorCode);
+// 處理 nested shadow table 發生的 PF trap
+rcStrict = PGMR0Trap0eHandlerNestedPaging(pVM, pVCpu, PGMMODE_EPT, uErrorCode, CPUMCTX2CORE(pCtx), GCPhys);
+TRPMResetTrap(pVCpu);
+
+if (rcStrict == VINF_SUCCESS || rcStrict == VERR_PAGE_TABLE_NOT_PRESENT || rcStrict == VERR_PAGE_NOT_PRESENT)
+{
+    // 成功 sync nested page tables
+    ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_GUEST_RIP | HM_CHANGED_GUEST_RSP | HM_CHANGED_GUEST_RFLAGS);
+    return VINF_SUCCESS;
+}
+return rcStrict;
 ```
 
 ---
@@ -2246,10 +2460,143 @@ if (!pExitRec)
 - exception error code
 - cr2
 
-```
-```
+```c
+/* Intel spec. 24.8.3 "VM-Entry Controls for Event Injection" specifies the interruption-information field to be 32-bits. */
+PCPUMCTX          pCtx       = &pVCpu->cpum.GstCtx;
+uint32_t          u32IntInfo = pEvent->u64IntInfo;
+uint32_t const    u32ErrCode = pEvent->u32ErrCode;
+uint32_t const    cbInstr    = pEvent->cbInstr;
+RTGCUINTPTR const GCPtrFault = pEvent->GCPtrFaultAddress;
+uint8_t const     uVector    = VMX_ENTRY_INT_INFO_VECTOR(u32IntInfo);
+uint32_t const    uIntType   = VMX_ENTRY_INT_INFO_TYPE(u32IntInfo);
 
 
+// hw interrupt / exception 沒辦法在 real mode 透過 software interrupt redirection bitmap 轉為 real mode task，需要透過 guest 的 interrupt handler 處理
+// 如果在 real mode (PE, Protected Mode Enable == 0)
+if (CPUMIsGuestInRealModeEx(pCtx))
+{
+    // 如果 unrestricted guest execution
+    if (pVCpu->CTX_SUFF(pVM)->hm.s.vmx.fUnrestrictedGuest)
+        // unset deliver-error-code bit
+        u32IntInfo &= ~VMX_ENTRY_INT_INFO_ERROR_CODE_VALID;
+    else
+        {
+            PVMCC pVM = pVCpu->CTX_SUFF(pVM);
+            PVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+            int rc2 = hmR0VmxImportGuestState(pVCpu, pVmcsInfo, CPUMCTX_EXTRN_SREG_MASK | CPUMCTX_EXTRN_TABLE_MASK | CPUMCTX_EXTRN_RIP | CPUMCTX_EXTRN_RSP | CPUMCTX_EXTRN_RFLAGS);
+
+        	// interrupt handler 存在於 IVT (real-mode IDT)
+            size_t const cbIdtEntry = sizeof(X86IDTR16);
+            if (uVector * cbIdtEntry + (cbIdtEntry - 1) > pCtx->idtr.cbIdt)
+            {
+                // 如果沒有 IDT entry 的情況下 inject #DF，會觸發 triple-fault
+                if (uVector == X86_XCPT_DF)
+                    return VINF_EM_RESET; // 需要重啟
+
+                // 如果沒有 IDT entry 的情況下 inject #GP，inject double-fault
+                if (uVector == X86_XCPT_GP)
+                {
+                    uint32_t const uXcptDfInfo = ...;
+                    HMEVENT EventXcptDf;
+                    RT_ZERO(EventXcptDf);
+                    EventXcptDf.u64IntInfo = uXcptDfInfo;
+                    return hmR0VmxInjectEventVmcs(pVCpu, pVmxTransient, &EventXcptDf, fStepping, pfIntrState);
+                }
+                
+                // 無效的 IDT entry --> inject #GP event
+                uint32_t const uXcptGpInfo = ...;
+                HMEVENT EventXcptGp;
+                RT_ZERO(EventXcptGp);
+                EventXcptGp.u64IntInfo = uXcptGpInfo;
+                return hmR0VmxInjectEventVmcs(pVCpu, pVmxTransient, &EventXcptGp, fStepping, pfIntrState);
+            }
+
+        	// SW: software exception
+            uint16_t uGuestIp = pCtx->ip;
+            if (uIntType == VMX_ENTRY_INT_INFO_TYPE_SW_XCPT)
+                // #BP and #OF 就直接恢復下一個 insn
+                uGuestIp = pCtx->ip + (uint16_t)cbInstr;
+            else if (uIntType == VMX_ENTRY_INT_INFO_TYPE_SW_INT)
+                uGuestIp = pCtx->ip + (uint16_t)cbInstr;
+
+            ...
+        }
+}
+```
+
+- IRB - interrupt redirection bitmap
+
+```c
+{
+    {
+        {
+			...
+			// 從 IDT entry 取得 code segment selector 跟 offset
+            X86IDTR16 IdtEntry;
+            RTGCPHYS const GCPhysIdtEntry = (RTGCPHYS)pCtx->idtr.pIdt + uVector * cbIdtEntry;
+            rc2 = PGMPhysSimpleReadGCPhys(pVM, &IdtEntry, GCPhysIdtEntry, cbIdtEntry);
+
+			// 為 interrupt handler 建立 stack frame
+            VBOXSTRICTRC rcStrict;
+			// pushes 2-byte 到 real-mode 中的 guest's stack
+            rcStrict = hmR0VmxRealModeGuestStackPush(pVCpu, pCtx->eflags.u32);
+            if (rcStrict == VINF_SUCCESS)
+            {
+                rcStrict = hmR0VmxRealModeGuestStackPush(pVCpu, pCtx->cs.Sel);
+                if (rcStrict == VINF_SUCCESS)
+                    rcStrict = hmR0VmxRealModeGuestStackPush(pVCpu, uGuestIp);
+            }
+
+			// 清除 eflag bit 並且跳去執行 interrupt/exception handler
+            if (rcStrict == VINF_SUCCESS)
+            {
+                pCtx->eflags.u32 &= ~(X86_EFL_IF | X86_EFL_TF | X86_EFL_RF | X86_EFL_AC);
+                pCtx->rip         = IdtEntry.offSel;
+                pCtx->cs.Sel      = IdtEntry.uSel;
+                pCtx->cs.ValidSel = IdtEntry.uSel;
+                pCtx->cs.u64Base  = IdtEntry.uSel << cbIdtEntry;
+                // hardware exception & page fault
+                if (uIntType == VMX_ENTRY_INT_INFO_TYPE_HW_XCPT && uVector == X86_XCPT_PF)
+                    pCtx->cr2 = GCPtrFault;
+
+                // 更新要在 guest 執行前更新的 register
+                ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, ...);
+
+               	// 如果處理的是 hw 並且有 block-by-sti，就把他清除
+                if (*pfIntrState & VMX_VMCS_GUEST_INT_STATE_BLOCK_STI)
+                    *pfIntrState &= ~VMX_VMCS_GUEST_INT_STATE_BLOCK_STI;
+
+                // 已經將 event 分發給 guest，mark pending false 讓我們如果在執行 guest code 前回 r3 的話不需要取消 event
+                pVCpu->hm.s.Event.fPending = false;
+
+                // 成功 single stepping，回傳給 debugger
+                if (fStepping)
+                    rcStrict = VINF_EM_DBG_STEPPED;
+            }
+            return rcStrict;
+			...
+        }
+    }
+}
+```
+
+```c
+// 如果 VM 在 protected mode
+
+// inject event into VMCS
+int rc = VMXWriteVmcs32(VMX_VMCS32_CTRL_ENTRY_INTERRUPTION_INFO, u32IntInfo);
+if (VMX_ENTRY_INT_INFO_IS_ERROR_CODE_VALID(u32IntInfo))
+    rc |= VMXWriteVmcs32(VMX_VMCS32_CTRL_ENTRY_EXCEPTION_ERRCODE, u32ErrCode);
+rc |= VMXWriteVmcs32(VMX_VMCS32_CTRL_ENTRY_INSTR_LENGTH, cbInstr);
+
+// update cr2 if #PF
+if (VMX_ENTRY_INT_INFO_IS_XCPT_PF(u32IntInfo))
+    pCtx->cr2 = GCPtrFault;
+
+return VINF_SUCCESS;
+```
+
+- 在 protected mode 就直接透過 VMCS 傳 event
 
 
 
