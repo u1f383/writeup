@@ -108,7 +108,7 @@ VMCS (Virtual Machine Control Structure)
 
 ---
 
-`HMR0Init(void)` - Does global Ring-0 HM initialization (at module init)
+`HMR0Init(void)` - Does global Ring-0 HM initialization (at module init)，會提供一些 API 給 r3 呼叫
 
 - HM - **Hardware Acceleration Manager** or **Hardware Assisted Virtualization Manager**，負責處理 VT-X 或 AMD-V 的相關資源
 
@@ -2606,5 +2606,884 @@ return VINF_SUCCESS;
 
 ## 7
 
+上面部分為 VT-X 的架構，後續 HM (Hardware Assisted Virtualization Manager) 就能利用這些 API 實作，一共分成 R0 跟 R3 兩個部分，code 存在於 VMM\VMMR0\HMR0.cpp , VMM\VMMR0\VMMR0.cpp  以及 VMM\VMMR3\HM.cpp。
 
+---
+
+`ModuleInit()` - Initialize the module. This is called when we're first loaded
+
+```c
+VMM_CHECK_SMAP_SETUP();
+VMM_CHECK_SMAP_CHECK(RT_NOTHING);
+
+// 初始化過程中會參雜 VMM_CHECK_SMAP_CHECK，檢查是否有 trigger SMAP
+int rc = vmmInitFormatTypes();
+rc = GVMMR0Init(); // 初始化 GVMM
+rc = GMMR0Init(); // 初始化 GMM
+rc = HMR0Init(); // 初始化 HM
+PDMR0Init(hMod); // 初始化 PDM
+rc = PGMRegisterStringFormatTypes();
+rc = PGMR0DynMapInit(); // optional
+rc = IntNetR0Init(); // internal network 初始化
+rc = PciRawR0Init(); // optional
+rc = CPUMR0ModuleInit();
+rc = vmmR0TripleFaultHackInit();
+rc = NEMR0Init();
+
+// 只要上方初始化時失敗，就會執行下面的 function
+NEMR0Term();
+vmmR0TripleFaultHackTerm();
+PciRawR0Term();
+IntNetR0Term();
+PGMR0DynMapTerm();
+PGMDeregisterStringFormatTypes();
+HMR0Term();
+GMMR0Term();
+GVMMR0Term();
+vmmTermFormatTypes();
+```
+
+- GVMM - Global VM Manager
+- GMM - Global Memory Manager
+- HM - Hardware Assisted Virtualization Manager
+- PDM - Pluggable Device and Driver Manager
+- IntNet - Internal Network
+
+---
+
+`vmmR0InitVM()` - Initiates the R0 driver for a particular VM instance
+
+```c
+// r3 跟 r0 的 SVN revision 不相符
+// uSvnRev: r3, VMMGetSvnRev(): r0
+if (uSvnRev != VMMGetSvnRev())
+    return VERR_VMM_R0_VERSION_MISMATCH;
+if (uBuildType != vmmGetBuildType()) // r0, r3 的 build type
+    return VERR_VMM_R0_VERSION_MISMATCH;
+
+int rc = GVMMR0ValidateGVMandEMT(pGVM, 0 /*idCpu*/);
+
+// 檢查 host 是否支援高精度的 timer
+if (   pGVM->vmm.s.fUsePeriodicPreemptionTimers
+    && !RTTimerCanDoHighResolution())
+    pGVM->vmm.s.fUsePeriodicPreemptionTimers = false;
+
+// 初始化 per VM data: GVMM 與 GMM
+// 但是似乎沒有 GMMR0InitVM()
+rc = GVMMR0InitVM(pGVM);
+if (RT_SUCCESS(rc))
+{
+    // 初始化 HM, CPUM, PGM
+    rc = HMR0InitVM(pGVM);
+    rc = CPUMR0InitVM(pGVM);
+    rc = PGMR0InitVM(pGVM);
+    rc = EMR0InitVM(pGVM); // EM: emulation manager
+    rc = PciRawR0InitVM(pGVM); // optional
+    rc = GIMR0InitVM(pGVM); // optional
+    GVMMR0DoneInitVM(pGVM);
+    return rc;
+}
+
+// 如果失敗會執行
+GIMR0TermVM(pGVM);
+PciRawR0TermVM(pGVM); // optional
+HMR0TermVM(pGVM);
+return rc;
+```
+
+- EM - emulation manager ?
+
+---
+
+`VMMR0EntryFast()` - The Ring 0 entry point, called by the fast-ioctl path，此處為 R0 的入口點，當 R3 要進 guest OS 時會呼叫此 function
+
+```c
+// 檢查 cpu id 是否落在合理的範圍
+if (   idCpu < pGVM->cCpus
+    && pGVM->cCpus == pGVM->cCpusUnsafe)
+{ /*likely*/ }
+else { ... /* error handle */ }
+
+PGVMCPU pGVCpu = &pGVM->aCpus[idCpu];
+RTNATIVETHREAD const hNativeThread = RTThreadNativeSelf();
+if (RT_LIKELY(   pGVCpu->hEMT == hNativeThread && pGVCpu->hNativeThreadR0 == hNativeThread))
+{ /* likely */ }
+else { ... /* error handle */ }
+
+// 處理 requested operation
+switch (enmOperation)
+{
+    // 用 HM 來執行 guest code
+    case VMMR0_DO_HM_RUN:
+    {
+        for (;;) /* hlt loop */
+        {
+            // Disable preemption
+            RTTHREADPREEMPTSTATE PreemptState = RTTHREADPREEMPTSTATE_INITIALIZER;
+            RTThreadPreemptDisable(&PreemptState);
+
+            // 檢查 host cpu id 是否合法，並且查看對應 cpu id 的 TSC delta 是否 available
+            RTCPUID  idHostCpu;
+            uint32_t iHostCpuSet = RTMpCurSetIndexAndId(&idHostCpu);
+            if (RT_LIKELY(iHostCpuSet < RTCPUSET_MAX_CPUS && SUPIsTscDeltaAvailableForCpuSetIndex(iHostCpuSet)))
+            {
+                pGVCpu->iHostCpuSet = iHostCpuSet;
+                ASMAtomicWriteU32(&pGVCpu->idHostCpu, idHostCpu);
+
+                /*
+                    * Update the periodic preemption timer if it's active.
+                    */
+                // 更新週期的 preeption timer
+                if (pGVM->vmm.s.fUsePeriodicPreemptionTimers)
+                    GVMMR0SchedUpdatePeriodicPreemptionTimer(pGVM, pGVCpu->idHostCpu, TMCalcHostTimerFrequency(pGVM, pGVCpu));
+
+				...
+```
+
+- EMT - emulation thread
+
+```c
+{
+    {
+        {
+            {
+                ...
+				int  rc;
+                bool fPreemptRestored = false;
+                // 如果目前有 suspend event 如 power event，就先不執行 guest OS
+                if (!HMR0SuspendPending())
+                {
+                    // 如果有 context switching hook 就 enable 此功能
+                    if (pGVCpu->vmm.s.hCtxHook != NIL_RTTHREADCTXHOOK)
+                        int rc2 = RTThreadCtxHookEnable(pGVCpu->vmm.s.hCtxHook);
+                    
+                    // 讓目前 CPU 開啟 VT-X
+                    rc = HMR0Enter(pGVCpu);
+                    if (RT_SUCCESS(rc))
+                    {
+                        VMCPU_SET_STATE(pGVCpu, VMCPUSTATE_STARTED_HM);
+
+                        // 如果有 preemption hooks，因為已經在 HM context 了
+                        // 因此可以 enable preemption
+                        if (vmmR0ThreadCtxHookIsEnabled(pGVCpu))
+                        {
+                            fPreemptRestored = true;
+                            RTThreadPreemptRestore(&PreemptState);
+                        }
+
+                        // 設置 longjmp 來執行 HMR0RunGuestCode()
+                        rc = vmmR0CallRing3SetJmp(&pGVCpu->vmm.s.CallRing3JmpBufR0, HMR0RunGuestCode, pGVM, pGVCpu);
+
+                        // 因為我們在 setjmp/longjmp 區域之外，所以用 normal assertion 會讓 host panic，因此用 manual assertion
+                        if (RT_UNLIKELY(   VMCPU_GET_STATE(pGVCpu) != VMCPUSTATE_STARTED_HM && RT_SUCCESS_NP(rc) && rc != VINF_VMM_CALL_HOST ))
+                            // 表示 HM 處於 wrong state
+                            rc = VERR_VMM_WRONG_HM_VMCPU_STATE;
+
+                        VMCPU_SET_STATE(pGVCpu, VMCPUSTATE_STARTED);
+                    }
+
+                    // 在禁用 context hook / 恢復 preemption 前無效化 host CPU id
+                    pGVCpu->iHostCpuSet = UINT32_MAX; // mark 成無效的值
+                    ASMAtomicWriteU32(&pGVCpu->idHostCpu, NIL_RTCPUID);
+
+                    // 因為 cleanup 的問題，回 ring-3 時 context hook 不能為 enable
+                    if (pGVCpu->vmm.s.hCtxHook != NIL_RTTHREADCTXHOOK)
+                    {
+                        ASMAtomicWriteU32(&pGVCpu->idHostCpu, NIL_RTCPUID);
+                        RTThreadCtxHookDisable(pGVCpu->vmm.s.hCtxHook); // disable
+                    }
+                }
+                else // system 處於 suspend，回 r3 處理
+                {
+                    rc = VINF_EM_RAW_INTERRUPT;
+                    pGVCpu->iHostCpuSet = UINT32_MAX;
+                    ASMAtomicWriteU32(&pGVCpu->idHostCpu, NIL_RTCPUID);
+                }
+                ...
+            }
+        }
+    }
+...
+```
+
+- `HMR0Enter()` - Enters the VT-x or AMD-V session
+- VINF_EM_RAW_INTERRUPT 似乎會回 r3 處理
+
+```c
+{
+    {
+        {
+            {
+                ...
+				// 恢復 preemption
+                if (!fPreemptRestored)
+                    RTThreadPreemptRestore(&PreemptState);
+
+                pGVCpu->vmm.s.iLastGZRc = rc;
+
+                // halt
+                if (rc != VINF_EM_HALT) { /* do nothing*/ }
+                else // guest os 執行到 hlt 會回傳 VINF_EM_HALT
+                {
+                    // 如果有 external interrupt，就繼續執行
+                    pGVCpu->vmm.s.iLastGZRc = rc = vmmR0DoHalt(pGVM, pGVCpu);
+                    if (rc == VINF_SUCCESS)
+                    {
+                        pGVCpu->vmm.s.cR0HaltsSucceeded++;
+                        continue;
+                    }
+                    // 沒有的話就回 r3
+                    pGVCpu->vmm.s.cR0HaltsToRing3++;
+                }
+            }
+            else
+            {
+                pGVCpu->iHostCpuSet = UINT32_MAX; // mark 成 invalid
+                ASMAtomicWriteU32(&pGVCpu->idHostCpu, NIL_RTCPUID);
+                
+                // enable preemption
+                RTThreadPreemptRestore(&PreemptState);
+                if (iHostCpuSet < RTCPUSET_MAX_CPUS)
+                {
+                    // 用 iHostCpuSet 來算 TSC delta
+                    int rc = SUPR0TscDeltaMeasureBySetIndex(pGVM->pSession, iHostCpuSet, 0, 2, 5*RT_MS_1SEC, 0);
+                    // target cpu 目前沒在運作 (offline)
+                    if (RT_SUCCESS(rc) || rc == VERR_CPU_OFFLINE)
+                        pGVCpu->vmm.s.iLastGZRc = VINF_EM_RAW_TO_R3; // 回 r3
+                    else
+                        pGVCpu->vmm.s.iLastGZRc = rc;
+                }
+                else
+                    pGVCpu->vmm.s.iLastGZRc = VERR_INVALID_CPU_INDEX;
+            }
+            break;
+
+        } /* halt loop. */
+        break;
+    }
+    case VMMR0_DO_NOP: ... ; /* for 效能測量 */
+    default:
+        pGVCpu->vmm.s.iLastGZRc = VERR_NOT_SUPPORTED;
+        break;
+}
+```
+
+- hlt 可以讓 CPU 進入待機模式，而在收到 external interrupt 時 (動到鍵盤、滑鼠) 就會醒來繼續執行
+- VMMR0_DO_RAW_RUN 已經被拔掉，不然似乎會透過 DBT 來執行
+
+---
+
+關於 r0、r3、rc/gc 的功用，在官方的討論區有[一篇文章](https://www.virtualbox.org/pipermail/vbox-dev/2016-February/013689.html)做了簡單的介紹：
+
+```
+Hi Luca,
+
+device emulation code in VirtualBox can run within three contexts:
+
+// 當我們在離開 guest 並回到 userland 時就會執行到這段 code
+* R3 (part of VBoxDD): Normal userland code executed in the VM
+  process context. This code is executed each time we leave the
+  guest and go back to userland. This code is not that performance-
+  critical, e.g. device initialization, memory allocation etc.
+
+// 從 VM 離開後進入 root mode 就會執行這段 code，整體的 code 比 r3 小很多，因為有些都可以直接用 host OS 所提供的 feature 實作
+* R0 (part of VMMR0): Code which is executed in kernel context.
+  This happens if the VM runs in VT-x/AMD-V mode and we left the
+  VM and entered the root mode where the VirtualBox VMM runs
+  (next to the host OS kernel). For performance reasons we don't
+  switch to userland (R3). The amount of R0 code is much smaller
+  than the amount of R3 code. Such code can also call host OS
+  kernel functions directly (e.g. submit a network IP packet to
+  the host OS network layer). Calling the host OS code from VMMR0
+  is usually done using SUPR0* functions which are implemented in
+  src/VBox/HostDrivers/Support and runtime functions which are
+  implemented in src/VBox/Runtime/r0drv
+
+// rc/gc 負責處理沒辦法在 VT-X AMD-V 執行的情況，這些 code 為 r0 的一部份
+* RC/GC (part of VMMRC.rc): This code is executed if the VM runs
+  in non VT-x/AMD-V mode (legacy). Only 32-bit code. This code is
+  part of the hypervisor which runs in R0 in the context of the
+  guest process. The guest itself runs at R1 (guest userland as
+  R3 as usual). Google should explain you x86 ring compression.
+  
+// guest os 運行在 r1，而 guest userland 一樣執行在 r3
+
+Of course R3 code cannot directly call R0 code. The code in our
+device driver has sections which are unique to two or all three
+contexts. That means that this code is compiled three times and
+exists in all three contexts. Other code is exclusively used in
+one or two contexts.
+```
+
+而前幾封信件中也有一些有用的資訊，稍微做個整理：
+
+- R3 process 需要透過 #GP 來存取 I/O space
+- with hardware virtualization, guest code 可以直接運行在 host's R0 context，因為 VM entries and exits 就是在此發生
+
+---
+
+`vmmR0DoHalt()` - This does one round of `vmR3HaltGlobal1Halt()`，如果 function 回傳 VINF_SUCCESS 代表繼續執行，其他的就回 R3。而此 function 會執行 2 次 waiting，一次為 polling、一次為 sleep，如果還是沒有 exteral interrupt 就回 r3
+
+```c
+// Number of ring-0 halts
+if (++pGVCpu->vmm.s.cR0Halts & 0xff)
+{ /* likely */ }
+else if (pGVCpu->vmm.s.cR0HaltsSucceeded > pGVCpu->vmm.s.cR0HaltsToRing3)
+{
+    pGVCpu->vmm.s.cR0HaltsSucceeded = 2;
+    pGVCpu->vmm.s.cR0HaltsToRing3   = 0;
+}
+else
+{
+    pGVCpu->vmm.s.cR0HaltsSucceeded = 0;
+    pGVCpu->vmm.s.cR0HaltsToRing3   = 2;
+}
+
+// 設置回 r3 前的 flag
+
+// VM 相關
+uint32_t const fVmFFs  = VM_FF_TM_VIRTUAL_SYNC | VM_FF_PDM_QUEUES | VM_FF_PDM_DMA | VM_FF_DBGF | VM_FF_REQUEST | VM_FF_CHECK_VM_STATE | VM_FF_RESET | VM_FF_EMT_RENDEZVOUS | VM_FF_PGM_NEED_HANDY_PAGES | VM_FF_PGM_NO_MEMORY              | VM_FF_DEBUG_SUSPEND;
+
+// CPU 相關
+uint64_t const fCpuFFs = VMCPU_FF_TIMER | VMCPU_FF_PDM_CRITSECT | VMCPU_FF_IEM | VMCPU_FF_REQUEST | VMCPU_FF_DBGF | VMCPU_FF_HM_UPDATE_CR3 | VMCPU_FF_HM_UPDATE_PAE_PDPES | VMCPU_FF_PGM_SYNC_CR3 | VMCPU_FF_PGM_SYNC_CR3_NON_GLOBAL | VMCPU_FF_TO_R3 | VMCPU_FF_IOM;
+
+// Checks 是否處於 MWAIT (monitor wait)
+unsigned const uMWait = EMMonitorWaitIsActive(pGVCpu);
+// 計算 guest 的 interruptiblity
+CPUMINTERRUPTIBILITY const enmInterruptibility = CPUMGetGuestInterruptibility(pGVCpu);
+
+if (pGVCpu->vmm.s.fMayHaltInRing0 && !TRPMHasTrap(pGVCpu) && (   enmInterruptibility == CPUMINTERRUPTIBILITY_UNRESTRAINED || uMWait > 1))
+{
+    // 如果 VM/CPU 的 force flag 的其中一個有 set，則需要回 r3 處理
+    if (!VM_FF_IS_ANY_SET(pGVM, fVmFFs) && !VMCPU_FF_IS_ANY_SET(pGVCpu, fCpuFFs))
+    {
+        // 檢查是否有 APIC pending interrupts 並更新
+        if (VMCPU_FF_TEST_AND_CLEAR(pGVCpu, VMCPU_FF_UPDATE_APIC))
+            APICUpdatePendingInterrupts(pGVCpu);
+
+        // wake up from hlt 的 flag
+        uint64_t const fIntMask = VMCPU_FF_INTERRUPT_APIC | VMCPU_FF_INTERRUPT_PIC | VMCPU_FF_INTERRUPT_NESTED_GUEST | VMCPU_FF_INTERRUPT_NMI  | VMCPU_FF_INTERRUPT_SMI | VMCPU_FF_UNHALT;
+
+        // VCPU 有 interrupt event 時，處理並回傳結果
+        if (VMCPU_FF_IS_ANY_SET(pGVCpu, fIntMask))
+            return vmmR0DoHaltInterrupt(pGVCpu, uMWait, enmInterruptibility);
+        ASMNopPause();
+
+        // 查看距離下個 time event 的時間
+        uint64_t u64Delta;
+        uint64_t u64GipTime = TMTimerPollGIP(pGVM, pGVCpu, &u64Delta);
+
+        // check again
+        if (!VM_FF_IS_ANY_SET(pGVM, fVmFFs) && !VMCPU_FF_IS_ANY_SET(pGVCpu, fCpuFFs))
+        {
+            if (VMCPU_FF_TEST_AND_CLEAR(pGVCpu, VMCPU_FF_UPDATE_APIC))
+                APICUpdatePendingInterrupts(pGVCpu);
+            if (VMCPU_FF_IS_ANY_SET(pGVCpu, fIntMask))
+                return vmmR0DoHaltInterrupt(pGVCpu, uMWait, enmInterruptibility);
+            
+            // 等到有足夠的時間執行 timer event
+            if (u64Delta >= pGVCpu->vmm.s.cNsSpinBlockThreshold)
+            {
+                // 同時有多個 CPU 執行，就延遲一下在做循環，等待其他 VCPU 會讓 device 發生 interrupt
+                if (pGVCpu->vmm.s.cR0HaltsSucceeded > pGVCpu->vmm.s.cR0HaltsToRing3 && RTMpGetOnlineCount() >= 4)
+                {
+                    uint32_t cSpinLoops = 42;
+                    // 重複做上述的事情：
+                    // 1. 檢查 APIC interrupt 並更新
+                    // 2. VM / CPU 的 force flag 是否設置，如果有的話要回 r3
+                    // 3. 是否有 interrupt，執行 vmmR0DoHaltInterrupt() 並回傳結果
+                    while (cSpinLoops-- > 0)
+                    {
+                        ASMNopPause();
+                        if (VMCPU_FF_TEST_AND_CLEAR(pGVCpu, VMCPU_FF_UPDATE_APIC))
+                            APICUpdatePendingInterrupts(pGVCpu);
+                        ASMNopPause();
+                        if (VM_FF_IS_ANY_SET(pGVM, fVmFFs))
+                            return VINF_EM_HALT;
+                        ASMNopPause();
+                        if (VMCPU_FF_IS_ANY_SET(pGVCpu, fCpuFFs))
+                            return VINF_EM_HALT;
+                        ASMNopPause();
+                        if (VMCPU_FF_IS_ANY_SET(pGVCpu, fIntMask))
+                            return vmmR0DoHaltInterrupt(pGVCpu, uMWait, enmInterruptibility);
+                        ASMNopPause();
+                    }
+                }
+
+                // STARTED --> STARTED_HALTED
+                if (VMCPU_CMPXCHG_STATE(pGVCpu, VMCPUSTATE_STARTED_HALTED, VMCPUSTATE_STARTED))
+                {
+                    if (!VM_FF_IS_ANY_SET(pGVM, fVmFFs) && !VMCPU_FF_IS_ANY_SET(pGVCpu, fCpuFFs))
+                    {
+                        if (VMCPU_FF_TEST_AND_CLEAR(pGVCpu, VMCPU_FF_UPDATE_APIC))
+                            APICUpdatePendingInterrupts(pGVCpu);
+                        if (VMCPU_FF_IS_ANY_SET(pGVCpu, fIntMask))
+                        {
+                            // HALTED --> STARTED
+                            VMCPU_CMPXCHG_STATE(pGVCpu, VMCPUSTATE_STARTED, VMCPUSTATE_STARTED_HALTED);
+                            return vmmR0DoHaltInterrupt(pGVCpu, uMWait, enmInterruptibility);
+                        }
+
+                        // hlt block
+                        uint64_t const u64StartSchedHalt   = RTTimeNanoTS();
+                        // 模擬 thread 停 u64GipTime 時間，也就是第二次 wait
+                        int rc = GVMMR0SchedHalt(pGVM, pGVCpu, u64GipTime);
+                        uint64_t const u64EndSchedHalt     = RTTimeNanoTS();
+                        uint64_t const cNsElapsedSchedHalt = u64EndSchedHalt - u64StartSchedHalt;
+                        // 設置狀態為 STARTED_HALTED --> STARTED
+                        VMCPU_CMPXCHG_STATE(pGVCpu, VMCPUSTATE_STARTED, VMCPUSTATE_STARTED_HALTED);
+                        if (rc == VINF_SUCCESS || rc == VERR_INTERRUPTED)
+                        {
+                            int64_t const cNsOverslept = u64EndSchedHalt - u64GipTime;
+                            // 重新檢查是否可以恢復執行 or 必須要回 r3 處理
+                            if (!VM_FF_IS_ANY_SET(pGVM, fVmFFs) && !VMCPU_FF_IS_ANY_SET(pGVCpu, fCpuFFs))
+                            {
+                                if (VMCPU_FF_TEST_AND_CLEAR(pGVCpu, VMCPU_FF_UPDATE_APIC))
+                                    APICUpdatePendingInterrupts(pGVCpu);
+                                if (VMCPU_FF_IS_ANY_SET(pGVCpu, fIntMask))
+                                    return vmmR0DoHaltInterrupt(pGVCpu, uMWait, enmInterruptibility);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+- `vmmR0DoHaltInterrupt()` - An interrupt or unhalt force flag is set, deal with it
+- `XXX_FF_IS_ANY_SET()` 看 force flag 有沒有被設置，如果有的話應該就需要回 r3
+
+---
+
+`vmmR0EntryExWorker()` - `VMMR0EntryEx()` worker function, either called directly or when ever possible called thru a longjmp so we can exit safely on failure，類似 driver 當中的 DispatchRoutine，VMMR0 driver 也同樣提供一些 ioctl 的 command 給 VMMR3 使用
+
+```c
+... // 省略參數檢查
+int rc;
+switch (enmOperation)
+{
+    // GVM request
+    case VMMR0_DO_GVMM_CREATE_VM:
+        if (pGVM == NULL && u64Arg == 0 && idCpu == NIL_VMCPUID)
+            rc = GVMMR0CreateVMReq((PGVMMCREATEVMREQ)pReqHdr, pSession);
+        else
+            rc = VERR_INVALID_PARAMETER;
+        VMM_CHECK_SMAP_CHECK(RT_NOTHING);
+        break;
+    ...
+}
+```
+
+其中有一些 operation 如 `VMMR0TermVM()` 比較有趣，提出來做分析。
+
+---
+
+`VMMR0TermVM()` - Terminates the R0 bits for a particular VM instance
+
+```c
+if (idCpu != NIL_VMCPUID)
+{
+    // Validates a GVM/EMT pair 是否合法
+    int rc = GVMMR0ValidateGVMandEMT(pGVM, idCpu);
+    if (RT_FAILURE(rc))
+        return rc;
+}
+
+// VM 的離開需要在 GVMM / GIM / HM 做一些處理
+if (GVMMR0DoingTermVM(pGVM))
+{
+    GIMR0TermVM(pGVM); 
+    HMR0TermVM(pGVM);
+}
+
+// 取消註冊 logger
+RTLogSetDefaultInstanceThread(NULL, (uintptr_t)pGVM->pSession);
+return VINF_SUCCESS;
+```
+
+- GVM - ring-0 (global) global VM
+- GVMM - Global VM Manager
+
+---
+
+>  進入 VMX mode 以及退出的相關 function
+
+
+
+`HMR0Enter()` - Enters the VT-x or AMD-V session
+
+```c
+// 當 suspend 的過程中 disable HM，這樣做能確保不進入 session 當中
+AssertReturn(!ASMAtomicReadBool(&g_HmR0.fSuspended), VERR_HM_SUSPEND_PENDING);
+Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD)); // preemption 已經 disable
+
+// 加載進入 HM 所需的最低限度的狀態
+int rc = hmR0EnterCpu(pVCpu);
+if (RT_SUCCESS(rc))
+{
+    // 如果 support VMX (intel) 就會是 set 的
+    if (g_HmR0.hwvirt.u.vmx.fSupported) { ... /* assertion */ }
+    else  { ... /* assertion */ } // 否則為 SVM (amd)
+
+    // keep track 有 VMCS 的 CPU，可能會用來 debugging 奇怪的 scheduling & ring-3 call
+    rc = g_HmR0.pfnEnterSession(pVCpu);
+
+    // 因為可能會在 longjump 後執行 code，有機會被其他 CPU schedule 到，所以在此保存 host-state
+    rc = g_HmR0.pfnExportHostState(pVCpu);
+}
+return rc;
+```
+
+---
+
+`hmR0EnterCpu()` - Turns on HM on the CPU if necessary and initializes the bare minimum state required for entering HM context
+
+```c
+Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD)); // preemption 已經 disable
+int              rc       = VINF_SUCCESS;
+RTCPUID const    idCpu    = RTMpCpuId();
+PHMPHYSCPU       pHostCpu = &g_HmR0.aCpuInfo[idCpu];
+
+// 如果還沒 config (or init ?)，就 enable VT-x or AMD-V on cpu
+if (!pHostCpu->fConfigured)
+    rc = hmR0EnableCpu(pVCpu->CTX_SUFF(pVM), idCpu);
+
+// 在 longjump to r3 前註冊 callback，讓 HM 可以在需要時禁用 VT-x/AMD-V
+VMMRZCallRing3SetNotification(pVCpu, hmR0CallRing3Callback, NULL);
+
+// 在從 r3/migrated CPU 回來時重新載入 host-state
+if (g_HmR0.hwvirt.u.vmx.fSupported) // VMX 
+    pVCpu->hm.s.fCtxChanged |= HM_CHANGED_HOST_CONTEXT | HM_CHANGED_VMX_HOST_GUEST_SHARED_STATE;
+else // SVM
+    pVCpu->hm.s.fCtxChanged |= HM_CHANGED_HOST_CONTEXT | HM_CHANGED_SVM_HOST_GUEST_SHARED_STATE;
+
+pVCpu->hm.s.idEnteredCpu = idCpu;
+return rc;
+```
+
+---
+
+`HMR0LeaveCpu()` - Deinitializes the bare minimum state used for HM context and if necessary disable HM on the CPU，離開 root mode
+
+```c
+RTCPUID const idCpu    = RTMpCpuId();
+PCHMPHYSCPU   pHostCpu = &g_HmR0.aCpuInfo[idCpu];
+
+// fGlobalInit: VT-x/AMD-V is enabled globally at init time，否則會在每次執行 guest code 前
+// fConfigured: VT-x or AMD-V 是否已經設置
+if (!g_HmR0.fGlobalInit && pHostCpu->fConfigured)
+{
+    int rc = hmR0DisableCpu(idCpu); // disable HW
+    // 確保在下次執行時獲得一個 non-zero ASID/VPID (NIL_RTCPUID for the first time)
+    pVCpu->hm.s.idLastCpu = NIL_RTCPUID;
+}
+
+// 目前擁有 VMCS 的 CPU 的 CPU ID，在離開 HW 時清除，hmPokeCpuForTlbFlush() 會需要
+pVCpu->hm.s.idEnteredCpu = NIL_RTCPUID;
+
+// deregister 跳到 r3 的 callback，代表我們已經不需要 hardware resources
+VMMRZCallRing3RemoveNotification(pVCpu);
+return VINF_SUCCESS;
+```
+
+- `hmR0DisableCpu()` - Disable VT-x or AMD-V on the current CPU
+
+---
+
+`hmR0DisableCpu()` - Disable VT-x or AMD-V on the current CPU
+
+```c
+PHMPHYSCPU pHostCpu = &g_HmR0.aCpuInfo[idCpu];
+
+Assert(!g_HmR0.hwvirt.u.vmx.fSupported || !g_HmR0.hwvirt.u.vmx.fUsingSUPR0EnableVTx);
+Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD)); // 關閉 preemption
+Assert(idCpu == (RTCPUID)RTMpCpuIdToSetIndex(idCpu)); /** @todo fix idCpu == index assumption (rainy day) */
+Assert(idCpu < RT_ELEMENTS(g_HmR0.aCpuInfo)); // cpuid 合法
+Assert(!pHostCpu->fConfigured || pHostCpu->hMemObj != NIL_RTR0MEMOBJ);
+
+if (pHostCpu->hMemObj == NIL_RTR0MEMOBJ) // objec ptr 指向 NULL
+    return pHostCpu->fConfigured ? VERR_NO_MEMORY : VINF_SUCCESS;
+
+int rc;
+if (pHostCpu->fConfigured)
+{
+    rc = g_HmR0.pfnDisableCpu(pHostCpu, pHostCpu->pvMemObj, pHostCpu->HCPhysMemObj);
+    pHostCpu->fConfigured = false; // 標註為還沒 config
+    pHostCpu->idCpu = NIL_RTCPUID; // 清除 cpuid
+}
+else
+    rc = VINF_SUCCESS;
+return rc;
+```
+
+- 有些 assertion 是要滿足 `!VMX` or `!enableVTx`，不太確定原因
+
+---
+
+`HMR0RunGuestCode()` - Runs guest code in a hardware accelerated VM，不過就是一個 wrapper function，呼叫對應支援的 VT run guest code function (`pfnRunGuestCode()`)
+
+```c
+... // some optional code
+VBOXSTRICTRC rcStrict = g_HmR0.pfnRunGuestCode(pVCpu);
+... // some optional code
+return VBOXSTRICTRC_VAL(rcStrict);
+```
+
+---
+
+`HMR0InvalidatePage()` - Invalidates a guest page from the host TLB，透過 HM 來 invalidate page
+
+```c
+PVMCC pVM = pVCpu->CTX_SUFF(pVM);
+if (pVM->hm.s.vmx.fSupported) // VMX
+    return VMXR0InvalidatePage(pVCpu, GCVirt);
+return SVMR0InvalidatePage(pVCpu, GCVirt); // SVM
+```
+
+---
+
+進入 HM 的 r3 部分前，大致瀏覽整個 r3 的執行流程中關於 init 與 fini 的部分：
+
+- `hmR3Init()`
+  - `hmR3InitFinalizeR0()`
+    - `hmR3InitFinalizeR0Intel()`
+    - `hmR3InitFinalizeR0Amd()`
+  - `hmR3InitFinalizeR3()`
+- `hmR3Term()`
+
+相關的 struct 有：
+
+- `struct HM` - HM VM Instance data. Changes to this must checked against the padding of the hm union in VM
+- `struct HMCPU` - HM VMCPU Instance data，其中**包含 VMCS**
+
+---
+
+`hmR3Init()` - Initializes the HM
+
+因為是 r3 重要的 function，因此一併附上官方的註解
+
+```c
+/* This is the very first component to really do init after CFGM so that we can
+ * establish the predominant execution engine for the VM prior to initializing
+ * other modules.  It takes care of NEM initialization if needed (HM disabled or
+ * not available in HW).
+ *
+ * If VT-x or AMD-V hardware isn't available, HM will try fall back on a native
+ * hypervisor API via NEM, and then back on raw-mode if that isn't available
+ * either.  The fallback to raw-mode will not happen if /HM/HMForced is set
+ * (like for guest using SMP or 64-bit as well as for complicated guest like OS
+ * X, OS/2 and others).
+ *
+ * Note that a lot of the set up work is done in ring-0 and thus postponed till
+ * the ring-3 and ring-0 callback to HMR3InitCompleted.
+ */
+```
+
+- 建立 execution engine
+- NEM initialization
+- 如果 VT-X or AMD-V 不支援，則 HM 會透過 NEM 使用 native hypervisor API 或回 raw-mode
+- **猜測**註解的意思為：在 r3 做的一些 setup 完成後會呼叫 r0 的 callback function `HMR3InitCompleted()`
+
+並且由於此 function 太大，只會取其中相較重要的部分
+
+```c
+// 註冊 internal data unit
+int rc = SSMR3RegisterInternal(pVM, "HWACCM", ...);
+// 註冊 info handler
+rc = DBGFR3InfoRegisterInternalEx(pVM, "hm", "Dumps HM info.", ...);
+...
+// 驗證 HM setting
+rc = CFGMR3ValidateConfig(pCfgHm, "/HM/", ...);
+...
+// 檢查 VT-X 或 AMD-v 是否支援，並設置一些相關的 flag
+if (pVM->fHMEnabled)
+{
+    uint32_t fCaps;
+    // 檢查是否支援，內部呼叫 ioctl 交給 VMMR0 處理 
+    rc = SUPR3QueryVTCaps(&fCaps);
+    if (RT_SUCCESS(rc))
+    {
+		...
+    }
+    else
+    {
+        const char *pszMsg;
+        switch (rc)
+        {
+            case VERR_UNSUPPORTED_CPU: ...; break;
+            case VERR_VMX_NO_VMX: ...; break;
+            ... // 省略其他 case，可以從 error msg 知道對應 error 在做什麼
+            default:
+                return VMSetError(pVM, rc, RT_SRC_POS, "SUPR3QueryVTCaps failed with %Rrc", rc);
+        }
+
+        pVM->fHMEnabled = false;
+        // 嘗試執行 NEM (native emulation monitor)
+        if (fFallbackToNEM)
+        {
+            int rc2 = NEMR3Init(pVM, true /*fFallback*/, fHMForced);
+        	...
+        }
+        if (RT_FAILURE(rc))
+            // 已經不支援 DBT
+            return VM_SET_ERROR(pVM, rc, pszMsg);
+    }
+```
+
+- NEM - native emulation monitor
+- 較新的 Vbox 已經不支援 DBT
+
+---
+
+`HMR3InitCompleted()` - Called when a init phase has completed
+
+```c
+switch (enmWhat)
+{
+    // ring-3 init 完成
+    case VMINITCOMPLETED_RING3:
+        return hmR3InitFinalizeR3(pVM);
+    // ring-0 init 完成
+    case VMINITCOMPLETED_RING0:
+        return hmR3InitFinalizeR0(pVM);
+    default:
+        return VINF_SUCCESS;
+}
+```
+
+---
+
+`hmR3InitFinalizeR0()` - Initialize VT-x or AMD-V，做了 flag 檢測以及對應的 error handler、CPU 初始化等等，由於大多相似，因此省略大部分程式碼
+
+```c
+// Enable VT-x or AMD-V on all host CPUs
+rc = SUPR3CallVMMR0Ex(VMCC_GET_VMR0_FOR_CALL(pVM), 0 /*idCpu*/, VMMR0_DO_HM_ENABLE, 0, NULL);
+...
+if (pVM->hm.s.vmx.fSupported)
+    rc = hmR3InitFinalizeR0Intel(pVM);
+else
+    rc = hmR3InitFinalizeR0Amd(pVM);
+...
+```
+
+---
+
+`hmR3InitFinalizeR0Intel()` - Finish VT-x initialization (after ring-0 init)
+
+```c
+// 透過 CPUID 取得對應的 value，失敗就將其清除
+if (... && CPUMR3GetGuestCpuIdFeature(pVM, CPUMCPUIDFEATURE_RDTSCP))
+    CPUMR3ClearGuestCpuIdFeature(pVM, CPUMCPUIDFEATURE_RDTSCP);
+...
+
+// Call ring-0 to set up the VM
+rc = SUPR3CallVMMR0Ex(VMCC_GET_VMR0_FOR_CALL(pVM), 0 /* idCpu */, VMMR0_DO_HM_SETUP_VM, 0 /* u64Arg */, NULL /* pReqHdr */);
+...
+CPUMR3SetGuestCpuIdFeature(pVM, CPUMCPUIDFEATURE_SEP);
+if (pVM->hm.s.fAllow64BitGuests)
+{
+    CPUMR3SetGuestCpuIdFeature(pVM, CPUMCPUIDFEATURE_PAE);
+    CPUMR3SetGuestCpuIdFeature(pVM, CPUMCPUIDFEATURE_LONG_MODE); // long mode
+    CPUMR3SetGuestCpuIdFeature(pVM, CPUMCPUIDFEATURE_SYSCALL); // 使用 syscall
+    CPUMR3SetGuestCpuIdFeature(pVM, CPUMCPUIDFEATURE_LAHF);
+    CPUMR3SetGuestCpuIdFeature(pVM, CPUMCPUIDFEATURE_NX);
+}
+...
+if (pVM->hm.s.fNestedPaging) // 支援 nested paging
+{
+	...
+    if (pVM->hm.s.fLargePages) // 支援 large paging
+        // 設置 EPT 開啟 2 MB
+        PGMSetLargePageUsage(pVM, true);
+}
+...
+// 針對 support 的 feature 執行對應的 handler
+if (pVM->hm.s.vmx.fVpid) { ... }
+if (pVM->hm.s.vmx.fUsePreemptTimer) { ... }
+if (pVM->hm.s.vmx.fUseVmcsShadowing) { ... }
+```
+
+---
+
+`hmR3InitFinalizeR3()` - Initializes HM components after ring-3 phase has been fully initialized
+
+```c
+if (!HMIsEnabled(pVM))
+    return VINF_SUCCESS;
+
+for (VMCPUID idCpu = 0; idCpu < pVM->cCpus; idCpu++)
+{
+    PVMCPU pVCpu = pVM->apCpusR3[idCpu];
+    pVCpu->hm.s.fActive = false; // 還沒使用 VT
+    // GIMR3Init() 跑完了，所以此時使用與 GIM 相關的 function 很安全
+    pVCpu->hm.s.fGIMTrapXcptUD = GIMShouldTrapXcptUD(pVCpu);
+}
+...
+```
+
+- `fGIMTrapXcptUD` -紀錄是否 \#UD 需要被 intercepted (required by certain GIM providers)
+
+---
+
+`HMR3Reset()` - The VM is being reset
+
+```c
+if (HMIsEnabled(pVM))
+    hmR3DisableRawMode(pVM);
+
+for (VMCPUID idCpu = 0; idCpu < pVM->cCpus; idCpu++)
+    HMR3ResetCpu(pVM->apCpusR3[idCpu]); // reset CPU
+
+// 清除所有 patch information
+pVM->hm.s.pGuestPatchMem     = 0;
+pVM->hm.s.pFreeGuestPatchMem = 0;
+pVM->hm.s.cbGuestPatchMem    = 0;
+pVM->hm.s.cPatches           = 0;
+pVM->hm.s.PatchTree          = 0;
+pVM->hm.s.fTPRPatchingActive = false;
+ASMMemZero32(pVM->hm.s.aPatches, sizeof(pVM->hm.s.aPatches));
+```
+
+---
+
+`HMR3ResetCpu()` - Resets a virtual CPU
+
+```c
+pVCpu->hm.s.fCtxChanged |= HM_CHANGED_HOST_CONTEXT | HM_CHANGED_ALL_GUEST;
+// 設置一些 event，當各種 manager 讀取到這些 flag 並跳出 for loop 進行處理，如呼叫 HMR3IsActive() 時檢查目前是否正在使用 hardware acceleration
+pVCpu->hm.s.fActive                        = false;
+pVCpu->hm.s.Event.fPending                 = false;
+pVCpu->hm.s.vmx.u64GstMsrApicBase          = 0;
+pVCpu->hm.s.vmx.VmcsInfo.fSwitchedTo64on32Obsolete = false;
+pVCpu->hm.s.vmx.VmcsInfo.fWasInRealMode    = true;
+```
+
+---
+
+`hmR3TermCPU()` - Terminates the per-VCPU HM，但什麼都沒有
+
+```c
+return VINF_SUCCESS;
+```
+
+---
+
+`HMR3Term()` - Terminates the HM
+
+```c
+if (pVM->hm.s.vmx.pRealModeTSS)
+{
+    // 釋放 VMM device heap 的記憶體
+    PDMR3VmmDevHeapFree(pVM, pVM->hm.s.vmx.pRealModeTSS);
+    pVM->hm.s.vmx.pRealModeTSS       = 0;
+}
+hmR3TermCPU(pVM);
+return 0;
+```
+
+
+
+## 8
 
