@@ -3482,8 +3482,3 @@ if (pVM->hm.s.vmx.pRealModeTSS)
 hmR3TermCPU(pVM);
 return 0;
 ```
-
-
-
-## 8
-

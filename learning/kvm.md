@@ -667,3 +667,268 @@ vm_irq_line(container_of(s, vm_t, serial), SERIAL_IRQ,
 ```
 
 - 當 transmitter FIFO 為空時會 trigger **transmitter holding register empty interrupt** (THRI)
+
+
+
+---
+
+> 如果對於 kvm 沒有很了解，可以參考[此篇文章](https://tw511.com/a/01/7301.html)，不但介紹了 kvm，同時也有說明 kvm-qemu 搭配在一起的情況，以下為看文章時做的一些筆記。
+>
+> P.S. 此翻譯&整理過的文章出處來自於[此系列文](https://www.cnblogs.com/sammyliu/category/696699.html)
+
+
+
+### Introduction
+
+KVM (kernel-based virtual machine) 以 kernel module 存在於 linux 上，使得 kernel 本身也成為一個 hypervisor，並且由於開源的關係，因此不僅發展快速，也有較高的安全性，不過仍存在著一些 [CVE](https://ubuntu.com/security/cves?package=linux-kvm)。
+
+首先 KVM 需要 virtualization extensions 技術的支援，較廣為人知的有 Intel VT 以及 AMD-V，而同時 KVM 也是 full-virtualization 的 hypervisor。其中 KVM 並沒辦法做硬體模擬，在遇到 IO 存取時會回到 userspace，此時 user 需要根據不同的回傳值來判斷不同種類的 IO 存取，並且做出對應的回覆。
+
+- Hypervisor 通常又稱作 VMM (Virtual machine monitor)
+- Virtualization extensions - 又稱作 Hardware-assisted virtualization，可以透過 host 的 hardware 來支援虛擬化，通常 CPU 會額外支援關於虛擬化的 instruction，舉 VT-x 為例，執行 `VMENTRY` 就代表進入 virtual machine 的執行環境
+- Full-virtualization - 相對應的是 Paravirtualization，關於兩者的簡單介紹如下：
+  - Full-virtualization - 允許 unmodified guest OS 直接運行，實際上會透過 VMM 模擬硬體。執行時採取 "捕獲 (trap) - 翻譯 (handle) - 模擬 (emulate)" 的模式運行，因為要模擬特權指令，所以會有**很大的 overhead**，而模擬的方式是透過 BT (Binary Translation)
+  - Paravirtualization - 因為需要透過一些 API (`hypercall` instruction) 來存取 host 的資源，因此 guest OS 通常需要修改 (modified)。由於是直接呼叫 instruction 來請求資源，因此不會有額外的 overhead，效能會比 Full-virtualization 好
+  - Hardware-assisted virtualization - Full-virtualization 配合硬體支援，取代 BT 而直接透過模式的切換來執行 instruction
+- 你可能會有聽到 Type-1 & Type-2 virtualization，主要是根據不同種類的 hypervisor 做區分：
+  - Type-1 (Bare-Metal hypervisor) - hypervisor 作為 microkernel 直接裝在 host OS，掌控硬體資源
+  - Type-2 (Hosted hypervisor) - hypervisor 作為一個正常的 process 執行
+
+
+
+Qemu 本身也是為一個 hypervisor，不過他主要都是用軟體去模擬指令的執行、一些 device 的 IO，並沒有使用 Hardware-assisted virtualization，因此執行速度相較緩慢。然而他的好處是擴充性高，使用者只需要使用 Qemu 提供的 API，就能迅速模擬出一個 device 讓 guest OS 做存取，
+
+- Qemu 使用的軟體模擬技術為 DBT (Dynamic Binary Translation)，Qemu 本身實作出的工具稱作 TCG (Tiny Code Generator)
+- DBT 的 input 為要模擬的一整塊 basic block 的 instruction，並且 instruction 可以是 hypervisor 本身所支援的 instruction set；output 為 host 本身的 instruction set 的 instruction
+- TCG 會在 input 與 output 中間加上一層 IR，也就是 input --> IR --> output，這樣可以減去 instruction 轉換的成本
+
+
+
+QEMU-KVM 結合 KVM 以及 QEMU 的優點，首先 KVM 已經處理了 memory mapping 以及 instruction emulation，之後由 QEMU 來提供硬體 I/O 虛擬化，並透過 `ioctl()` /dev/kvm 裝置和 KVM 互動。
+
+
+
+而 QEMU-KVM 相比原生 QEMU 的改動：
+
+- 原生的 QEMU 通過 BT 實現 CPU 的 full-virtualization，但是修改後的 QEMU-KVM 會呼叫 `ioctl()` 來呼叫 KVM 模組
+- 原生的 QEMU 是 single-thread 實現，QEMU-KVM 是 multi-thread 實現
+
+
+
+### KVM
+
+KVM 提供的功能有：
+
+- 支援 CPU 和 memory Overcommit
+  - Overcommit 代表可以要求超過實際可以 handle 的 memory，實際上在使用到才會為其分配 physical memory
+- 支援半虛擬化 I/O (virtio)
+- 支援熱插拔 (cpu，block device、network device 等)
+- 支援對稱多處理 (Symmetric Multi-Processing，縮寫爲 SMP)
+- 支援實時遷移 (Live Migration)
+- 支援 PCI device 直接分配和單根 I/O 虛擬化 (SR-IOV)
+  - SR-IOV - single-root IO virtualization
+- 支援 kernel 同頁合併 (KSM)
+  - KSM - kernel samepage merging
+- 支援 NUMA
+  - NUMA - Non-Uniform Memory Access (非一致儲存存取結構)
+
+
+
+### 架構
+
+整體架構如下圖：
+
+![img](../images/kvm1.png)
+
+- qemu-kvm 透過 `ioctl()` 對 kvm instance 下指令，KVM 會將 VCPU 的 guest context 載入到 VMCS (virtual machine control structure) 當中
+- 一個 kvm instance 即是一個 qemu-kvm process，與其他 linux process 一樣被 schedule
+- Qemu-KVM 的部分包括 Virtual memory、VCPU 和 Virtual I/O device；記憶體和 CPU 的虛擬化由 KVM kernel module 負責，I/O device 的虛擬化由 QEMU 負責實作
+- KVM guest OS 的記憶體是 qumu-kvm process 的 memory region 一部分
+- 以 Intel VT-x 為例，host OS 以及 VMM 執行在 VMX root 當中，guest OS 及其 application 執行在 VMX nonroot
+  - root mode 的切換是透過 `VMENTRY` 以及 `VMEXIT` instruction
+
+
+
+也有一張也很詳細的架構圖：
+
+![img](../images/kvm2.png)
+
+
+
+### Scheduling
+
+如果要將 guest OS 內的 thread 排程到某個 host 本身的物理 CPU，需要經歷兩個過程：
+
+1. guest OS 的 thread 排程到 guest 本身的 CPU 即 KVM VCPU，而此 scheduling 由 guest OS 負責，每個 guest OS 的實現方式不同
+2. **vCPU thread** 排程到 host physical CPU，該排程由 Hypervisor 即 Linux kernel 負責
+
+
+
+### Virtual memory
+
+![img](../images/kvm3.png)
+
+KVM 實現 guest OS **記憶體**虛擬化的方式是，利用 **mmap** 系統呼叫，在 QEMU 的 virtual address 中申請一塊連續的大小的空間，用於 guest OS 的 physical memory mapping。
+
+
+
+KVM 內部實現記憶體虛擬化的方式有：
+
+- software - 以軟體實現 Shadow page table (GVA --> HPA)
+- hardware - based on CPU 的硬體支援，如 AMD NPT 和 Intel EPT
+- 透過 hardware 實現後，hypervisor 不需要在支援 SPT (Shadow Page Table)，並且需要透過軟體的轉換，降低了在切換 VM 時造成的 overhead，hardware 也相較穩定
+
+
+
+KSM (Kernel SamePage Merging) - 以 ksmd (daemon) 存在，其會定期掃描 page，將多個相似的 memory paging 合併成一個，用於減少多個 VM 擁有多個相似的 memory mapping，整個流程如下：
+
+1. 初始狀態
+   ![img](../images/kvm4.png)
+
+2. 合併後
+   ![img](../images/kvm5.png)
+3. guest1 寫入後：
+   ![img](../images/kvm6.png)
+
+不過每次 scan 都會有 overhead，因此建議在開啟多個 VM 時在啟動。
+
+
+
+### IO 的虛擬化
+
+Qemu-kvm 中，guest OS 的 device 可以分成：
+
+1. emulation device - 完全由 Qemu 軟體模擬的裝置 (default)
+2. VirtIO device - 實現 VIRTIO API 的半虛擬化裝置
+3. PCI 裝置直接分配 - PCI device assignment
+
+從 guest OS 的 IO 請求，到 host 處理完回覆給 guest 的整個流程如下：
+
+1. guest OS 的 device driver 發起 I/O request
+2. KVM 攔截 IO request
+3. KVM 整理 IO info 後放到 IO sharing page，通知 Qemu
+4. Qemu 取得 IO info 後，交給 hardware emulation component 去處理
+5. Qemu 將結果放到 IO sharing page，通知 KVM
+6. KVM 讀取結果，整理後放到 guest OS
+
+P.S. 如果 guest OS 使用 DMA (Direct Memory Access) 存取大塊 IO 時，會直接透過 memory maping 寫到 guest OS 當中，並通知 KVM 已經處理完成。
+
+
+
+Qemu 模擬許多 hardware device，以網卡為例，若啟動時沒有傳入相關參數，則 QEMU 預設分配 rtl8139 型別的虛擬網絡卡型別給 guest OS 使用，使用 "預設使用者模式"，這時候由於沒有具體的網路模式的設定，guest 的網路功能是有限的。而使用 Qemu-kvm 時，KVM 可以選擇的網路模式包括：
+
+- 預設使用者模式 (User)
+- 基於網橋 (Bridge) 的模式
+- 基於 NAT (Network Address Translation) 的模式
+
+
+
+而在 KVM 中可以使用 **Para-virtualizaiton** 提升 guest 的 I/O 效能，目前採用的是 VirtIO 此 Linux 上的裝置驅動標準框架，其提供了一種 host 與 guest 互動的 IO framework。VirtIO 採用在 guest OS 中安裝前端驅動 (Front-end driver) 和在 Qemu 中實現後端驅動 (Back-enddiver) 的方式，前後端驅動通過 **vring** 直接溝通，省略了 KVM 轉送的過程，提高了 I/O 的效能。簡單來說，使用 virtio 不需要接收到 trap 後做後續處理，**guest OS 可以和 QEMU 的 I/O 直接溝通**。實際運作參考下方兩張圖：
+
+![img](../images/kvm7.png)
+
+![img](../images/kvm8.png)
+
+完整的 IO 流程如下：
+
+![img](../images/kvm9.png)
+
+- 如果 host 要傳送資料給 guest，就 inject interrupt 通知 guest 處理
+- 如果 guest 要傳給 host，就透過 hypercall (instruction emulation)，此處不確定是 full-virtualization 怎麼處理
+
+
+
+總結來說，Virtio 是一個在 Hypervisor 之上的抽象 API interface，主要是提升 guest OS 的執行效率，同時也會讓 guest OS 知道自己執行在虛擬化環境中，整個架構由多個 components 組成：
+
+- 前端驅動 - guest OS 中安裝的驅動程式模組
+- 後端驅動 - 在 Qemu 中實現，呼叫主機上的物理裝置，或者完全由軟體實現
+- virtio 層 - virtio queue interface，連接了前端驅動和後端驅動，而驅動可以根據需要使用不同數目的 queue，比如 virtio-net 使用兩個 queue，virtio-block 只使用一個 queue，實際上 queue 是使用 virtio-ring 來實作
+- virtio-ring - 實現 virtual queue 的 ring buffer
+
+總結使用 virtio 的優缺點：
+
+- 優點： 更高的 IO 效能，幾乎可以和原生系統差不多
+- 缺點： guest OS 必須安裝特定的 virtio 驅動，可以使用 `lsmod | grep virtio` 查看是否載入
+
+
+
+linux 一共實現了 5 個前端驅動：
+
+![img](../images/kvm10.png)
+
+- virtio-blk - block device (e.g. disk)
+- virtio-net - 網路裝置
+- virtio-pci - PCI 裝置
+- virtio-balloon -氣球驅動程式 (動態管理 guest OS 的記憶體使用情況)
+- virtio-console - console 驅動程式
+
+一般狀況下是不會載入，當使用對應的 virtio 裝置時才會載入。以 virtio-net 為例，他的功能為：
+
+![img](../images/kvm11.png)
+
+- 多個 VM 共用 host 的網絡卡 eth0
+- Qemu 使用標準的 tun/tap 將 VM 的網路橋接到主機 NIC 上
+- 每個 VM 看起來有一個直接連線到主機 PCI 總線上的私有 virtio 網路裝置
+- 需要在 VM 內安裝 virtio驅動
+
+細節的部分：
+
+![img](../images/kvm12.png)
+
+1. guest OS 內的 driver 會將請求放入 vring 當中
+2. guest driver 發送通知 Qemu 處理 (`Virtqueue_kick()` 會被呼叫)
+3. Qemu 取得 vring 內的 request
+4. 由於為 network request，發送至 TUN/TAP
+5. 處理完畢，像 guest 發送 interrupt
+
+
+
+vhost-net 為 kernel-level virtio server，將 virtio-net 的後端處理任務放到 kernel 中執行，減少 kernel 與 userspace 之間的切換，差異如下：
+
+![img](../images/kvm13.png)
+
+
+
+virtio-balloon 為比較特別的 virtio device，可以在 guest OS 執行時動態調整它所佔用的 host 記憶體資源，而不需要關閉 guest。當 host 需要多點記憶體時，請求回收 guest 的部分記憶體，如果 guest 不足的話，會將部分使用中的 memory 放到 swap 當中；反之，如果 guest 不足，並且 host 還有多餘的記憶體，則可以擴充 guest 能使用的記憶體。
+
+- guest 變少： inflate，膨脹氣球，page out
+- guest 變多： deflate，壓縮氣球，page in
+
+流程如下：
+
+1. KVM 發送請求給 VM 讓其歸還一定數量的記憶體給 KVM
+2. VM 的 virtio_balloon 驅動接到該請求
+3. VM 的驅動讓 guest 的記憶體氣球膨脹，氣球中的記憶體就不能被 guest 使用
+4. VM 的 guest OS 歸還氣球中的記憶體給 VMM
+5. KVM 可以將得到的記憶體分配到任何需要的地方
+6. KM 也可以將記憶體返還到 guest 中 (壓縮 guet 的氣球)
+
+
+
+### SR-IOV [KVM PCI/PCIe Pass-Through SR-IOV]
+
+裝置直接分配 (Device assignment) 也稱作 Device Pass-Through，是將 host 的 PCI/PCIe 直接分配給 guest 使用，guest 存取 device 就是等同於直接透過 PCI 使用對應的 device，而 CPU 需要支援 Intel VT-d 或者 AMD IOMMU。優缺點如下：
+
+- 優點：在執行 I/O 操作時大量減少 VM-Exit 到 Hypervisor 處理的情況，效能可以達到幾乎和原生系統一樣的效能，而 VT-d 克服了 virtio 相容性不好和 CPU 使用頻率較高的問題
+- 缺點：
+  - 一臺伺服器主機板上的空間比較有限，因此允許新增的 PCI 和 PCI-E 裝置是有限的
+  - 對於使用 VT-d 直接分配了裝置的客戶機，其 live migration 功能將受限，不過也可以使用熱插拔或者 libvirt 工具等方式解決此問題
+
+VT-d 直接分配硬體資源給 guest，雖然提升效能，但同時也侷限了硬體資源的使用範圍。 SR-IOV (Single Root I/O Virtualization and sharing) 為 PCI-SIG 組織所發佈的規範，定義了一個標準化的機制，以支援實現多個 guest 共用一個裝置，目前最被廣泛用於 NIC。
+
+
+
+一個帶有 SR-IOV 功能的物理裝置能被設定為多個功能單元，一共有兩種功能單元 (function)：
+
+- 物理功能 (Physical Functions，PF) - 這是完整的帶有 SR-IOV 能力的PCIe 裝置，能像普通 PCI 裝置那樣被發現、管理和設定
+- 虛擬功能 (Virtual Functions，VF) - 只能處理 I/O 等簡單的 PCIe 功能，並且每個 VF 都是從 PF 中分離出來的，每個 PF 都有一個 VF 數目的限制
+
+Hypervisor 能將一個或者多個 VF 分配給一個 VM。同個時間一個 VF 只能被分配給一個 VM，而一個 VM 可以擁有多個 VF。
+
+
+
+總結上述各種虛擬化 NIC 的方法：
+
+![img](../images/kvm16.png)
+
+![img](../images/kvm15.png)
