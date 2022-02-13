@@ -137,9 +137,9 @@ SYSCALL_DEFINE2(brohammer, long *, addr, long, bit)
 
 而在最後一步時我發現到 page 的資料對應不上，此時才想到 page directory entry 的 PS bit (bit 7) 為 page size，當設為 1 的時候每個 page 大小為 2MB，可能是因為沒注意到的原因，導致找到錯誤的 page table，以下為 manual 的資料：
 
-![img](../writeup/images/MSunCTF1.png)
+![img](images/MSunCTF1.png)
 
-![img](../writeup/images/MSunCTF2.png)
+![img](images/MSunCTF2.png)
 
 - P - present
 - R/W - read / write
