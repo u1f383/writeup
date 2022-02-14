@@ -17,6 +17,56 @@ qemu-system-x86_64 \
 
 memory 大小為 128MB (0x8000000)，並且可以發現 kaslr 是沒有開的 (nokaslr)，因此每次載入的 code base (`_text`) 皆為固定。
 
+`init`：
+
+```bash
+#!/bin/sh
+
+mount -t devtmpfs none /dev
+mount -t proc none /proc
+mount -t sysfs none /sys
+
+/sbin/mdev -s
+
+chown -R root.root / > /dev/null 2>&1
+chown broham.broham /home/broham
+
+HOME=/home/broham
+ENV=$HOME/.profile; export ENV
+
+cat <<EOF
+
+██████╗ ██████╗  ██████╗ ██╗  ██╗ █████╗ ███╗   ███╗███╗   ███╗███████╗██████╗
+██╔══██╗██╔══██╗██╔═══██╗██║  ██║██╔══██╗████╗ ████║████╗ ████║██╔════╝██╔══██╗
+██████╔╝██████╔╝██║   ██║███████║███████║██╔████╔██║██╔████╔██║█████╗  ██████╔╝
+██╔══██╗██╔══██╗██║   ██║██╔══██║██╔══██║██║╚██╔╝██║██║╚██╔╝██║██╔══╝  ██╔══██╗
+██████╔╝██║  ██║╚██████╔╝██║  ██║██║  ██║██║ ╚═╝ ██║██║ ╚═╝ ██║███████╗██║  ██║
+╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝     ╚═╝╚══════╝╚═╝  ╚═╝
+
+Look, if you had one shot or one opportunity,
+                To seize everything you ever wanted in one moment,
+                              Would you hack with it, or just let it flip? Yo!
+══════════════════════════════════════════════════════════════════════════════╗
+EOF
+
+cat /src/brohammer.c
+
+cat <<EOF
+══════════════════════════════════════════════════════════════════════════════╝
+EOF
+
+setsid cttyhack setuidgid 0 /bin/sh
+
+echo -ne "\n"
+echo "Bye!"
+
+umount /dev
+umount /proc
+umount /sys
+
+poweroff -d 0 -f
+```
+
 
 
 題目在 kernel 中實作一個 syscall，source code 如下：
@@ -216,13 +266,24 @@ int main()
 
 
 
-
-
 ##### mephi42
 
+他的攻擊手法為：
 
+1. 透過下斷點在 [bprm_fill_uid](https://elixir.bootlin.com/linux/v4.17/source/fs/exec.c#L1509)，得到目標檔案的 `bprm->file->f_path.dentry->d_inode` 位址
+   - 他提到因為 `CONFIG_SMP` disable, `nokaslr` 以及使用 **initramfs**，因此 inode 的位址都會相同
+   - bprm == `struct linux_binprm`，用於保存在載入 binary 時的執行參數以及環境
+2. 我們的目標檔案為 `/bin/iconv`，在 flip `inode->i_mode` ( `inode->i_mode ^= S_ISUID`) 之後，`/bin/iconv` 就會有 suid 的權限，再來就可以透過 `/bin/iconv /root/flag` 讀 flag
 
-#### other
+此方法在有 symbol 的 kernel 會比較方便，一般都會透過官方提供的 vmlinux-extract 將 ELF 從 bzImage 抽出來，而 [vmlinux-to-elf](https://github.com/marin-m/vmlinux-to-elf) 會去爬 kallsyms，加上一些找得到的 symbol，這樣在下斷點時就不需要找 address，直接透過 symbol 下就可以了。
+
+除此之外，他也有提到其他做過的嘗試，有些想法還滿有趣的：
+
+- 直接 flip busybox 的 SUID - **CANT**，busybox 會在執行過程中 [drops privileges](https://git.busybox.net/busybox/tree/libbb/appletlib.c?h=1_33_stable#n682)
+- 建立一堆能夠讀檔的 binary，隨機 flip 一個檔案的 SUID - **CANT**，不能建立 root 權限的執行檔，所以有 SUID 也沒用
+- Flip bit in IDT，讓 interrupt handler 回到 userspace 執行 - **CANT**，因為 canonical kernel address start 的開頭為 `ffff`，而 canonical userspace address 的開頭為 `0000`
+- Flip bit in [user_addr_max() ](https://elixir.bootlin.com/linux/v4.17/source/arch/x86/include/asm/uaccess.h#L39)，讓 `copy_from_user()` / `copy_to_user()` 出現問題 - 同上
+- Flip bit in **global length variable** bound to a `/proc` or `/sys` file (e.g. `/sys/kernel/boot_params/data`)，這樣就可以 dump 所有用過此 file 的 memory，而因為使用 initramfs 的關係，flag 會存在於 kernel memory 當中 - **CANT**，因為相關變數不是在初始化時複製到 heap 內，就是被 marked 成 `__ro_after_init`，不能更動
 
 
 
