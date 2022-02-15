@@ -1395,3 +1395,374 @@ return rc;
 ```
 
 - 在 EMT 非 EMT0 時只會 deregister VMCPU，其他 EMT 結束時才會 deregister VM 本身
+
+---
+
+和 OS 裡的 thread 類似， EMT 也提供了一套可以 pause / wakeup / waiting 的 API，在 VM 處於不同狀態的時候，對應的 function 也不同，以下為 method 的 enumeration：
+
+```c
+/** The halt method. */
+typedef enum
+{
+    /** The usual invalid value. */
+    VMHALTMETHOD_INVALID = 0,
+    /** Use the method used during bootstrapping. */
+    VMHALTMETHOD_BOOTSTRAP,
+    /** Use the default method. */
+    VMHALTMETHOD_DEFAULT,
+    /** The old spin/yield/block method. */
+    VMHALTMETHOD_OLD,
+    /** The first go at a block/spin method. */
+    VMHALTMETHOD_1,
+    /** The first go at a more global approach. */
+    VMHALTMETHOD_GLOBAL_1,
+    /** The end of valid methods. (not inclusive of course) */
+    VMHALTMETHOD_END,
+    /** The usual 32-bit max value. */
+    VMHALTMETHOD_32BIT_HACK = 0x7fffffff
+} VMHALTMETHOD;
+```
+
+以及對應到的 function：
+
+```c
+// Array with halt method descriptors.
+static const struct VMHALTMETHODDESC
+{
+    // method ID
+    VMHALTMETHOD                enmHaltMethod;
+    // 確定該 method 是否支援在 r0 暫停
+    bool                        fMayHaltInRing0;
+    // 用來初始化變數以及載入 config 的 init function
+    DECLR3CALLBACKMEMBER(int,   pfnInit,(PUVM pUVM));
+    // termination function
+    DECLR3CALLBACKMEMBER(void,  pfnTerm,(PUVM pUVM));
+    // VMR3WaitHaltedU() 做完 log & assertion 後會呼叫此 function
+    DECLR3CALLBACKMEMBER(int,   pfnHalt,(PUVMCPU pUVCpu, const uint32_t fMask, uint64_t u64Now));
+    // VMR3WaitU() 做完 log & assertion 後會呼叫此 function
+    DECLR3CALLBACKMEMBER(int,   pfnWait,(PUVMCPU pUVCpu));
+    // VMR3NotifyCpuFFU() 做完 log & assertion 後會呼叫此 function
+    DECLR3CALLBACKMEMBER(void,  pfnNotifyCpuFF,(PUVMCPU pUVCpu, uint32_t fFlags));
+    // VMR3NotifyGlobalFFU() 做完 log & assertion 後會呼叫此 function
+    DECLR3CALLBACKMEMBER(void,  pfnNotifyGlobalFF,(PUVM pUVM, uint32_t fFlags));
+} g_aHaltMethods[] =
+{
+    { VMHALTMETHOD_BOOTSTRAP, ...},
+    { VMHALTMETHOD_OLD, ...},
+    { VMHALTMETHOD_1, ...},
+    { VMHALTMETHOD_GLOBAL_1, ...},
+};
+```
+
+- 建立 VM 時 (`vmR3CreateUVM()`)，會執行 `pUVM->vm.s.enmHaltMethod = VMHALTMETHOD_BOOTSTRAP` 來指定呼叫 bootstrap halt method；啟動完 VM 後 (`vmR3CreateU()` 的後半段)，會執行 `vmR3SetHaltMethodU(pUVM, VMHALTMETHOD_DEFAULT)`，設置成呼叫 default method
+
+
+
+`vmR3SetHaltMethodU()` - Changes the halt method
+
+```c
+PVM pVM = pUVM->pVM
+// 改變成 default
+if (enmHaltMethod == VMHALTMETHOD_DEFAULT)
+{
+    uint32_t u32;
+    // 從 config 內讀指令的 method
+    int rc = CFGMR3QueryU32(CFGMR3GetChild(CFGMR3GetRoot(pVM), "VM"), "HaltMethod", &u32);
+    if (RT_SUCCESS(rc))
+    {
+        enmHaltMethod = (VMHALTMETHOD)u32;
+        if (enmHaltMethod <= VMHALTMETHOD_INVALID || enmHaltMethod >= VMHALTMETHOD_END)
+            return VMSetError(pVM, VERR_INVALID_PARAMETER, RT_SRC_POS, N_("Invalid VM/HaltMethod value %d"), enmHaltMethod);
+    }
+    else if (rc == VERR_CFGM_VALUE_NOT_FOUND || rc == VERR_CFGM_CHILD_NOT_FOUND)
+        // 找不到對應的 function
+        return VMSetError(pVM, rc, RT_SRC_POS, N_("Failed to Query VM/HaltMethod as uint32_t"));
+    else
+        // 如果沒設置，就把 method 狀態換成 VMHALTMETHOD_GLOBAL_1
+        enmHaltMethod = VMHALTMETHOD_GLOBAL_1;
+}
+
+// 找 descriptor
+unsigned i = 0;
+while (i < RT_ELEMENTS(g_aHaltMethods) && g_aHaltMethods[i].enmHaltMethod != enmHaltMethod)
+    i++;
+
+// 透過 Rendezvous worker 呼叫 vmR3SetHaltMethodCallback()
+return VMMR3EmtRendezvous(pVM, VMMEMTRENDEZVOUS_FLAGS_TYPE_ASCENDING, vmR3SetHaltMethodCallback, (void *)(uintptr_t)i);
+```
+
+---
+
+`VMR3WaitHalted()` - Halted VM Wait，讓 VCPU 在 for loop 中等到可以繼續執行 (wakeup)
+
+```c
+// 檢查相關的 force flag
+const uint32_t fMask = !fIgnoreInterrupts
+    ? VMCPU_FF_EXTERNAL_HALTED_MASK
+    : VMCPU_FF_EXTERNAL_HALTED_MASK & ~(VMCPU_FF_UPDATE_APIC | VMCPU_FF_INTERRUPT_APIC | VMCPU_FF_INTERRUPT_PIC);
+if (VM_FF_IS_ANY_SET(pVM, VM_FF_EXTERNAL_HALTED_MASK) ||  VMCPU_FF_IS_ANY_SET(pVCpu, fMask))
+    return VINF_SUCCESS;
+
+if (pVCpu->idCpu == 0) // EMT0 在 halt 時先暫停 yielder
+    VMMR3YieldSuspend(pVM);
+TMNotifyStartOfHalt(pVCpu); // 通知 TM CPU 要進入 halt
+
+PUVMCPU pUVCpu = pVCpu->pUVCpu;
+uint64_t u64Now = RTTimeNanoTS();
+... // 時間紀錄
+
+VMCPU_SET_STATE(pVCpu, VMCPUSTATE_STARTED_HALTED); // update state
+PUVM pUVM = pUVCpu->pUVM;
+// 呼叫 halt method
+int rc = g_aHaltMethods[pUVM->vm.s.iHaltMethod].pfnHalt(pUVCpu, fMask, u64Now);
+// 呼叫完畢，換回 state
+VMCPU_SET_STATE(pVCpu, VMCPUSTATE_STARTED);
+
+// 通知 TM 並且 resume yielder
+TMNotifyEndOfHalt(pVCpu);
+if (pVCpu->idCpu == 0) // EMT0
+    VMMR3YieldResume(pVM);
+
+return rc;
+```
+
+- `TMNotifyStartOfHalt()` - Notification that the cpu is entering the halt state
+
+
+
+`vmR3HaltGlobal1Halt()` - The global 1 halt method - Block in GMM (**ring-0**) and let it try take care of the global scheduling of EMT threads
+
+```c
+PUVM    pUVM  = pUVCpu->pUVM;
+PVMCPU  pVCpu = pUVCpu->pVCpu;
+PVM     pVM   = pUVCpu->pVM;
+
+// halt loop
+int rc = VINF_SUCCESS;
+ASMAtomicWriteBool(&pUVCpu->vm.s.fWait, true); // mark 成正在等待
+unsigned cLoops = 0;
+for (;; cLoops++)
+{
+    // 向 timer 請求時間，檢查是否可以 exit
+    TMR3TimerQueuesDo(pVM);
+    if (VM_FF_IS_ANY_SET(pVM, VM_FF_EXTERNAL_HALTED_MASK) ||  VMCPU_FF_IS_ANY_SET(pVCpu, fMask))
+        break;
+
+    // 估算下個 event 的時間
+    uint64_t u64Delta;
+    uint64_t u64GipTime = TMTimerPollGIP(pVM, pVCpu, &u64Delta);
+    // 如果有 external interrupt
+    if (VM_FF_IS_ANY_SET(pVM, VM_FF_EXTERNAL_HALTED_MASK) ||  VMCPU_FF_IS_ANY_SET(pVCpu, fMask))
+        break;
+
+    // 如果沒有 spinning，並且時間間隔不是每個都很小，就 block
+    // cNsSpinBlockThresholdCfg: threshold between spinning and blocking
+    if (u64Delta >= pUVM->vm.s.Halt.Global1.cNsSpinBlockThresholdCfg)
+    {
+        VMMR3YieldStop(pVM); // 暫停 CPU yielder
+        // FF checking
+        if (VM_FF_IS_ANY_SET(pVM, VM_FF_EXTERNAL_HALTED_MASK) ||  VMCPU_FF_IS_ANY_SET(pVCpu, fMask))
+            break;
+
+        uint64_t const u64StartSchedHalt   = RTTimeNanoTS();
+        rc = SUPR3CallVMMR0Ex(VMCC_GET_VMR0_FOR_CALL(pVM), pVCpu->idCpu, VMMR0_DO_GVMM_SCHED_HALT, u64GipTime, NULL);
+        uint64_t const u64EndSchedHalt     = RTTimeNanoTS();
+        uint64_t const cNsElapsedSchedHalt = u64EndSchedHalt - u64StartSchedHalt;
+
+        if (rc == VERR_INTERRUPTED) // 接收到 interrupt
+            rc = VINF_SUCCESS;
+        else if (RT_FAILURE(rc))
+        {
+            rc = vmR3FatalWaitError(pUVCpu, "vmR3HaltGlobal1Halt: VMMR0_DO_GVMM_SCHED_HALT->%Rrc\n", rc);
+            break;
+        }
+    }
+    // 如果是進行 spinning，一陣子就 wakeup 一次，所以實際上並不是完全 spinning
+    else if (!(cLoops & 0x1fff)) // 每 0x2000 就 wakeup
+        rc = SUPR3CallVMMR0Ex(VMCC_GET_VMR0_FOR_CALL(pVM), pVCpu->idCpu, VMMR0_DO_GVMM_SCHED_POLL, false, NULL);
+}
+ASMAtomicUoWriteBool(&pUVCpu->vm.s.fWait, false);
+return rc;
+```
+
+
+
+`vmR3HaltMethod1Halt()` - Method 1 - Block whenever possible, and when lagging behind switch to spinning for 10-30ms with occasional blocking until the lag has been eliminated，能做 block 就 block，當 lag 時就換成 spinning 10-30 ms 並偶爾切到 block，直到 lag 結束
+
+
+
+
+
+---
+
+>  再來分析 halt method array 內所對應到的 function，不過一部分已經在上面有介紹了
+
+VMR3WaitU - 讓 VCPU waiting 事件的發生
+
+
+
+`vmR3DefaultWait()` - Default `VMR3Wait()` worker
+
+```c
+ASMAtomicWriteBool(&pUVCpu->vm.s.fWait, true);
+PVM    pVM   = pUVCpu->pVM;
+PVMCPU pVCpu = pUVCpu->pVCpu;
+int    rc    = VINF_SUCCESS;
+for (;;) // FF 滿足 suspend 條件 or 有其他狀況發生時 (RT_FAILURE(rc)) 才會離開
+{
+    // 檢查相關的 force flag
+    if (    VM_FF_IS_ANY_SET(pVM, VM_FF_EXTERNAL_SUSPENDED_MASK)
+        ||  VMCPU_FF_IS_ANY_SET(pVCpu, VMCPU_FF_EXTERNAL_SUSPENDED_MASK))
+        break;
+
+    // 等待片刻，可能會有人呼叫 wakeup 或 interrupt
+    rc = RTSemEventWait(pUVCpu->vm.s.EventSemWait, 1000);
+    if (rc == VERR_TIMEOUT)
+        rc = VINF_SUCCESS;
+    else if (RT_FAILURE(rc))
+    {
+        rc = vmR3FatalWaitError(pUVCpu, "RTSemEventWait->%Rrc", rc);
+        break;
+    }
+}
+ASMAtomicUoWriteBool(&pUVCpu->vm.s.fWait, false);
+return rc;
+```
+
+
+
+`vmR3HaltGlobal1Wait()` - VMR3Wait() worker
+
+```c
+ASMAtomicWriteBool(&pUVCpu->vm.s.fWait, true);
+
+PVM    pVM   = pUVCpu->pUVM->pVM;
+PVMCPU pVCpu = VMMGetCpu(pVM);
+int rc = VINF_SUCCESS;
+for (;;)
+{
+    // break when suspend
+    if (    VM_FF_IS_ANY_SET(pVM, VM_FF_EXTERNAL_SUSPENDED_MASK)
+        ||  VMCPU_FF_IS_ANY_SET(pVCpu, VMCPU_FF_EXTERNAL_SUSPENDED_MASK))
+        break;
+	// 用 ioctl 呼叫 r0 暫停 VCPU
+    rc = SUPR3CallVMMR0Ex(VMCC_GET_VMR0_FOR_CALL(pVM), pVCpu->idCpu, VMMR0_DO_GVMM_SCHED_HALT, RTTimeNanoTS() + 1000000000 /* +1s */, NULL);
+    if (rc == VERR_INTERRUPTED)
+        rc = VINF_SUCCESS;
+    else if (RT_FAILURE(rc))
+    {
+        rc = vmR3FatalWaitError(pUVCpu, "vmR3HaltGlobal1Wait: VMMR0_DO_GVMM_SCHED_HALT->%Rrc\n", rc);
+        break;
+    }
+}
+
+ASMAtomicUoWriteBool(&pUVCpu->vm.s.fWait, false);
+return rc;
+```
+
+- `SUPR3CallVMMR0Ex()` - r3 通過 `ioctl()` 呼叫 r0 執行一些指令
+
+
+
+`vmR3BootstrapWait()` - Bootstrap VMR3Wait() worker，當 VM 一開始建立時是使用這個 function，因為這時候還沒有初始化 VMMR0，因此這只是普通的 sleep
+
+```c
+... // 與上方相同
+for (;;)
+{
+    // 檢查是否有 interrupt
+	// global request (因為為 VM)
+    if (pUVM->vm.s.pNormalReqs   || pUVM->vm.s.pPriorityReqs)
+        break;
+    // local request (為 VCPU)
+    if (pUVCpu->vm.s.pNormalReqs || pUVCpu->vm.s.pPriorityReqs)
+        break;
+
+    if (... /* suspend FF */)
+        break;
+    if (pUVM->vm.s.fTerminateEMT) // VM 已經結束
+        break;
+
+    ... // 與上方相同
+}
+... // 與上方相同
+```
+
+---
+
+VMR3NotifyCpuFFU - wakeup a VCPU
+
+
+
+`vmR3DefaultNotifyCpuFF()` - Default `VMR3NotifyFF()` worker
+
+```c
+if (pUVCpu->vm.s.fWait)
+    // 發送 signal
+    int rc = RTSemEventSignal(pUVCpu->vm.s.EventSemWait);
+else
+{
+    PVMCPU pVCpu = pUVCpu->pVCpu;
+    if (pVCpu)
+    {
+        VMCPUSTATE enmState = pVCpu->enmState;
+        if (   enmState == VMCPUSTATE_STARTED_EXEC_NEM
+            || enmState == VMCPUSTATE_STARTED_EXEC_NEM_WAIT)
+            NEMR3NotifyFF(pUVCpu->pVM, pVCpu, fFlags);
+    }
+}
+```
+
+
+
+`vmR3HaltGlobal1NotifyCpuFF()` - The global 1 halt method - `VMR3NotifyFF()` worker
+
+```c
+// 當 r0 halt 時，fWait 的狀態為 unset，因此需要檢查 CPU state 來看要做什麼 wakeup
+PVMCPU pVCpu = pUVCpu->pVCpu;
+if (pVCpu)
+{
+    VMCPUSTATE enmState = VMCPU_GET_STATE(pVCpu);
+    // 如果 VCPU 在等待狀態
+    if (enmState == VMCPUSTATE_STARTED_HALTED || pUVCpu->vm.s.fWait)
+        // R0 - VMMR0_DO_GVMM_SCHED_WAKE_UP
+        int rc = SUPR3CallVMMR0Ex(VMCC_GET_VMR0_FOR_CALL(pUVCpu->pVM), pUVCpu->idCpu, VMMR0_DO_GVMM_SCHED_WAKE_UP, 0, NULL);
+    else if ((fFlags & VMNOTIFYFF_FLAGS_POKE) || !(fFlags & VMNOTIFYFF_FLAGS_DONE_REM))
+    {
+        if (enmState == VMCPUSTATE_STARTED_EXEC)
+        {
+            if (fFlags & VMNOTIFYFF_FLAGS_POKE)
+                // VMMR0_DO_GVMM_SCHED_POKE
+                int rc = SUPR3CallVMMR0Ex(VMCC_GET_VMR0_FOR_CALL(pUVCpu->pVM), pUVCpu->idCpu, VMMR0_DO_GVMM_SCHED_POKE, 0, NULL);
+        }
+        // 如果是 native EM (BT)
+        else if (enmState == VMCPUSTATE_STARTED_EXEC_NEM || enmState == VMCPUSTATE_STARTED_EXEC_NEM_WAIT)
+            NEMR3NotifyFF(pUVCpu->pVM, pVCpu, fFlags);
+    }
+}
+else if (pUVCpu->vm.s.fWait)
+    // VMMR0_DO_GVMM_SCHED_WAKE_UP
+    int rc = SUPR3CallVMMR0Ex(VMCC_GET_VMR0_FOR_CALL(pUVCpu->pVM), pUVCpu->idCpu, VMMR0_DO_GVMM_SCHED_WAKE_UP, 0, NULL);
+```
+
+- VMMR0_DO_GVMM_SCHED_WAKE_UP - Wakes up the halted EMT thread so it can service a pending request
+- VMMR0_DO_GVMM_SCHED_POKE - Pokes an EMT if it's still busy running guest code
+
+
+
+`vmR3BootstrapNotifyCpuFF()` - Bootstrap VMR3NotifyFF() worker
+
+```c
+if (pUVCpu->vm.s.fWait)
+{
+    // 發送 event signal
+    int rc = RTSemEventSignal(pUVCpu->vm.s.EventSemWait);
+}
+```
+
+- fWait - Wait/Idle indicator
+
+
+
+## 9
+
