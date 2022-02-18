@@ -68,7 +68,7 @@ My ctf writeup and log 😎
 - [Qemu](./learning/Qemu.md)
 - [eBPF](./learning/eBPF.md)
 - [ContextSwitch](./learning/ContextSwitch.md)
-- [Note of pwnie island](./learning/Note of pwnie island.md)
+- [Note of pwnie island](./learning/Note%20of%20pwnie%20island.md)
 - [V8](./learning/V8.md)
 - [kvm](./learning/kvm.md)
 - [DynamicLinking](./learning/DynamicLinking.md)
