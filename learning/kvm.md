@@ -932,3 +932,20 @@ Hypervisor 能將一個或者多個 VF 分配給一個 VM。同個時間一個 V
 ![img](../images/kvm16.png)
 
 ![img](../images/kvm15.png)
+
+---
+
+> 參考 [架設 Linux KVM 虛擬化主機](https://www.lijyyh.com/2015/12/linux-kvm-set-up-linux-kvm.html)
+
+### virtual disk 格式
+
+KVM 提供了一些虛擬化磁碟的方法：
+
+- Image - 一共支援兩種
+  - Raw images - 僅提供簡單資料存放的 diask，因此通常具有存取上較快的優點
+  - QEMU Copy On Write 2 (qcow2) - qcow2 的磁碟格式具有 snapshot、壓縮與加密等額外的功能
+- Block devices
+  - Entire devices - 利用**整個儲存裝置**做為虛擬磁碟，例如 /dev/sdb。
+  - Partitions - 利用**磁碟分割**做為虛擬磁碟，例如 /dev/sdb2。
+  - Logical Volumes - 利用邏輯磁區管理員 (Logical Volume Mamager, LVM) 所建立的邏輯磁區 (LV)來做為虛擬磁碟，例如 /dev/VolGroup00/LogVol00
+    - LVM 具有自己的 snapshot 功能，不過很慢，並且會造成大量的主機 I/O。

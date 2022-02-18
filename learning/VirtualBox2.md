@@ -1766,3 +1766,467 @@ if (pUVCpu->vm.s.fWait)
 
 ## 9
 
+> 每個 VM 都有一個或者多個 VCPU，VCPU 是 VM 運行的單位，類似於 OS 中的 process 和 thread 的概念，VM 是 process，VCPU 是 thread，一個 host 裡可以有多個 VM
+>
+> 每個 VCPU 都需要 global variale 保存相關資訊，比如 VCPU 進入/退出 GuestOS 都需要保存相關 context，實際上是透過 struct VMCPU 來保存
+
+VMCPUSTATE 在上方已經有介紹，主要是描述 VMCPU 的執行狀態。而 VMCPU 的結構如下：
+
+```c
+typedef struct VMCPU
+{
+    // Per CPU forced action.
+    uint32_t volatile       fLocalForcedActions;
+    uint32_t                fForLocalForcedActionsExpansion;
+    VMCPUSTATE volatile     enmState; // cpu state
+    RTCPUID volatile        idHostCpu; // EMT 對應到的 host cpu id 
+    uint32_t volatile       iHostCpuSet; // 對應的 idHostCpu 的 CPU set index
+    uint8_t                 abAlignment0[64 - 20]; // padding 到 64 bytes
+
+    // IEM
+    union VMCPUUNIONIEMSTUB
+    {
+        struct IEMCPU       s;
+    } iem;
+
+    // per-cpu data
+    PVMR3                   pVMR3; // r3 host context vm ptr
+    RTR0PTR                 pVCpuR0ForVtg; // r0 host context vm ptr
+    uint32_t                pVMRC; // raw-mode context vm pter
+    uint32_t                pVMRCPadding;
+    PUVMCPU                 pUVCpu; // r3 UVMCPU ptr
+    RTNATIVETHREAD          hNativeThread; // native thread handle
+    RTNATIVETHREAD          hNativeThreadR0; // r0 NT
+    VMCPUID                 idCpu; // CPU ID
+
+    // alignment
+    uint8_t                 abAlignment1[64 - 5 * (HC_ARCH_BITS == 32 ? 4 : 8) - 8 - 4];
+
+    // HM
+    union VMCPUUNIONHM
+    {
+        struct HMCPU    s;
+    } hm;
+
+    // NEM
+    union VMCPUUNIONNEM
+    {
+        struct NEMCPU       s;
+    } nem;
+
+    // TRPM
+    union VMCPUUNIONTRPM
+    {
+        struct TRPMCPU      s;
+    } trpm;
+
+    // TM
+    union VMCPUUNIONTM
+    {
+        struct TMCPU        s;
+    } tm;
+
+    // VMM
+    union VMCPUUNIONVMM
+    {
+        struct VMMCPU       s;
+    } vmm;
+
+    // PDM
+    union VMCPUUNIONPDM
+    {
+        struct PDMCPU       s;
+    } pdm;
+
+    // IOM
+    union VMCPUUNIONIOM
+    {
+        struct IOMCPU       s;
+    } iom;
+
+    // DBGF
+    union VMCPUUNIONDBGF
+    {
+        struct DBGFCPU      s;
+    } dbgf;
+
+    // GIM
+    union VMCPUUNIONGIM
+    {
+        struct GIMCPU s;
+    } gim;
+
+    // APIC
+    union VMCPUUNIONAPIC
+    {
+        struct APICCPU      s;
+    } apic;
+
+	... // 不常見的
+	// PGM
+    union VMCPUUNIONPGM
+    {
+        struct PGMCPU       s;
+    } pgm;
+
+    // CPUM
+    union VMCPUUNIONCPUM
+    {
+        struct CPUMCPU      s;
+        CPUMCTX             GstCtx;
+    } cpum;
+
+    // EM 
+    union VMCPUUNIONEM
+    {
+        struct EMCPU        s;
+    } em;
+} VMCPU;
+```
+
+- 名詞解釋 again
+  - NEM - native emulation manager
+  - MM - memory manager
+  - CPUM - CPU manager / monitor
+  - PGM - page manager / monitor
+  - TM - time manager
+  - VMM - virtual machine monitor
+  - SELM - the selector manager，用在 DBT
+  - TRPM - trap monitor
+  - SSM - saved state manager
+  - IOM - input / output monitor
+  - EM - execution manager / monitor
+  - IEM - interpreted execution manager
+  - DBGF - debugger facility
+  - GIM - guest interface manager
+  - PDM - pluggable device manager
+- 每個 CPU 系列都有一個 db / CPUID range / MSR range
+
+
+
+`struct CPUMCTX` - CPU context，保存 VCPU 的 register information
+
+- context (上下文) 指的應該是 VM 在執行時 register 資訊
+
+截取部分 source code：
+
+```c
+typedef struct CPUMCTX
+{
+    // General purpose registers
+    union /* no tag! */
+    {
+        /// X86_GREG_XXX
+        CPUMCTXGREG     aGRegs[16];
+        // 64-bit general reg
+        RT_GCC_EXTENSION struct /* no tag! */
+        {
+            uint64_t    rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15;
+        } CPUM_STRUCT_NM(qw);
+		...        
+        RT_GCC_EXTENSION struct /* no tag! */
+        {
+            uint64_t    r0, r1, r2, r3, r4, r5, r6, r7;
+        } CPUM_STRUCT_NM(qw2);    
+		...
+    }
+    ...
+}
+```
+
+
+
+`struct CPUMFEATURES` - CPU features and quirks. This is mostly **exploded CPUID info**
+
+- 不僅定義了 CPU 所提供的功能，也同時定義 CPUID instruction 回傳的結果
+
+```c
+typedef struct CPUMFEATURES
+{
+    uint8_t         enmCpuVendor; // CPU vendor
+    uint8_t         uFamily; // CPU family
+    uint8_t         uModel; // CPU model
+    uint8_t         uStepping; // CPU stepping
+    uint32_t        enmMicroarch;
+    uint8_t         cMaxPhysAddrWidth; // 最大的 physical address width
+    uint8_t         cMaxLinearAddrWidth; // 最大的 linear address width
+    uint16_t        cbMaxExtendedState; // extended state 最大的 size
+
+    // 支援的 msrs
+    uint32_t        fMsr : 1;
+    uint32_t        fPse : 1; // page size extension ...
+    ...
+}
+```
+
+
+
+`struct CPUMCPUIDLEAF` - 定義與 CPUID leaf 相關的值
+
+- From wiki： `CPUID` EAX register 來確定返回資訊的主類別，在 intel 最新的術語中，這被稱為 CPUID leaf；CPU 支援的最高 EAX 呼叫參數稱作 leaf，當 CPUID = 0 時會回傳 leaf value
+- guest 模擬 CPUID 時，會把每個 EAX 所對應到的 return value 存放在 `CPUMCPUIDLEAF`
+
+```c
+typedef struct CPUMCPUIDLEAF
+{
+    uint32_t    uLeaf; // leaf number
+    uint32_t    uSubLeaf; // sub-leaf number
+    uint32_t    fSubLeafMask; // sub-leaf mask
+    uint32_t    uEax; // eax
+    uint32_t    uEbx; // ebx
+    uint32_t    uEcx; // ecx
+    uint32_t    uEdx; // edx
+    uint32_t    fFlags; // fFlags
+} CPUMCPUIDLEAF;
+```
+
+
+
+`struct CPUMCPUID` - The register set returned by a CPUID operation，也就是 CPUID 回傳的結構
+
+```c
+typedef struct CPUMCPUID
+{
+    uint32_t uEax;
+    uint32_t uEbx;
+    uint32_t uEcx;
+    uint32_t uEdx;
+} CPUMCPUID;
+```
+
+
+
+`struct CPUMMSRRANGE` - 保存每個 MSR register value
+
+```c
+typedef struct CPUMMSRRANGE
+{
+    uint32_t    uFirst; // first: [0]
+    uint32_t    uLast; // last: [4]
+    uint16_t    enmRdFn; // CPUMMSRRDFN: [8]
+    uint16_t    enmWrFn; // CPUMMSRWRFN: [10]
+    uint16_t    offCpumCpu;// 與 CPUMCPU 結構的 offset
+    uint16_t    fReserved; // future
+    uint64_t    uValue; // init/read value: [16]
+    uint64_t    fWrIgnMask; // write ignore bit: [24]
+    uint64_t    fWrGpMask; // 寫入時會觸發 GP(0) 的 bit: [32]
+    char        szName[56]; // register name
+} CPUMMSRRANGE;
+```
+
+- range 指的就是 array
+- `CPUMMSRRDFN / CPUMMSRWRFN` - 定義讀 (RDFN) 與寫 (WRFN) 特定 MSR 時會呼叫到的 function
+
+
+
+`struct CPUMINFO` - CPU info
+
+```c
+typedef struct CPUMINFO
+{
+	// msr num
+    uint32_t                    cMsrRanges;
+    // mask for ecx of msr request
+    uint32_t                    fMsrMask;
+    uint32_t                    fMxCsrMask;
+
+    // CPUID leaf 個數
+    uint32_t                    cCpuIdLeaves;
+    // 第一個 extended CPUID leaf 的 idx
+    uint32_t                    iFirstExtCpuIdLeaf;
+    // 處理 unknown CPUID leaf 的方法，共有四種
+    CPUMUNKNOWNCPUID            enmUnknownCpuIdMethod;
+    CPUMCPUID                   DefCpuId; // default cpuid value
+    uint64_t                    uScalableBusFreq;
+
+    // msr array r0 ptr
+    R0PTRTYPE(PCPUMMSRRANGE)    paMsrRangesR0;
+    // cpu leaf r0 ptr
+    R0PTRTYPE(PCPUMCPUIDLEAF)   paCpuIdLeavesR0;
+    // msr array r3 ptr
+    R3PTRTYPE(PCPUMMSRRANGE)    paMsrRangesR3;
+    // cpu leaf r3 ptr
+    R3PTRTYPE(PCPUMCPUIDLEAF)   paCpuIdLeavesR3;
+} CPUMINFO;
+```
+
+
+
+`CPUMHOSTCTX` - The saved host CPU state，保存 host 的 context
+
+```c
+typedef struct CPUMHOSTCTX
+{
+    // general purpose register
+    /*uint64_t        rax; - scratch*/
+    uint64_t        rbx;
+    /*uint64_t        rcx; - scratch*/
+    /*uint64_t        rdx; - scratch*/
+    uint64_t        rdi;
+    uint64_t        rsi;
+    uint64_t        rbp;
+    uint64_t        rsp;
+    /*uint64_t        r8; - scratch*/
+    /*uint64_t        r9; - scratch*/
+    uint64_t        r10;
+    uint64_t        r11;
+    uint64_t        r12;
+    uint64_t        r13;
+    uint64_t        r14;
+    uint64_t        r15;
+    /*uint64_t        rip; - scratch*/
+    uint64_t        rflags;
+
+    // Selector registers
+    RTSEL           ss;
+    RTSEL           ssPadding;
+    RTSEL           gs;
+    RTSEL           gsPadding;
+    RTSEL           fs;
+    RTSEL           fsPadding;
+    RTSEL           es;
+    RTSEL           esPadding;
+    RTSEL           ds;
+    RTSEL           dsPadding;
+    RTSEL           cs;
+    RTSEL           csPadding;
+
+    // control register
+    uint64_t        cr0;
+    /*uint64_t        cr2; - scratch*/
+    uint64_t        cr3;
+    uint64_t        cr4;
+    uint64_t        cr8;
+
+    // debug register
+    uint64_t        dr0;
+    uint64_t        dr1;
+    uint64_t        dr2;
+    uint64_t        dr3;
+    uint64_t        dr6;
+    uint64_t        dr7;
+
+    X86XDTR64       gdtr; // global descritor table
+    uint16_t        gdtrPadding;
+    
+    X86XDTR64       idtr; // interrupt descritor table
+    uint16_t        idtrPadding;
+    
+    RTSEL           ldtr; // local descritor table
+    RTSEL           ldtrPadding;
+
+    RTSEL           tr; // task table
+    RTSEL           trPadding;
+
+    // msr
+    CPUMSYSENTER    SysEnter;
+    uint64_t        FSbase;
+    uint64_t        GSbase;
+    uint64_t        efer;
+    uint8_t         auPadding[8]; // for padding
+
+	// FPU/SSE/AVX/XXXX state ring-0 mapping 的 pointer
+    R0PTRTYPE(PX86XSAVEAREA)    pXStateR0;
+	// FPU/SSE/AVX/XXXX state ring-3 mapping 的 pointer
+    R3PTRTYPE(PX86XSAVEAREA)    pXStateR3;
+    // xcr0 register
+    uint64_t                    xcr0;
+    uint64_t                    fXStateMask;
+} CPUMHOSTCTX;
+```
+
+- scratch 的意思是？
+
+
+
+`CPUM` - 每個 VCPU 會有一個對應到的 CPUM
+
+```c
+typedef struct CPUM
+{
+    uint32_t                fHostUseFlags; // host 有用的 CPU feature
+    struct
+    {
+        uint32_t            AndMask;
+        uint32_t            OrMask;
+    } CR4; // cr4 mask
+
+    uint8_t                 u8PortableCpuIdLevel; // portable CPUID level
+    bool                    fPendingRestore; // 是否正在送 state restore
+    uint8_t                 abPadding0[2];
+
+    // expose 給 guest 的 XSAVE/XRTOR components mask
+    uint64_t                fXStateGuestMask;
+    // host 所決定要 expose 給 guest 的 XSAVE/XRTOR components
+    uint64_t                fXStateHostMask;
+    uint32_t                fHostMxCsrMask; // host MXCSR mask
+    bool                    fNestedVmxPreemptTimer; // nested VMX 會用到
+    uint8_t                 abPadding1[3];
+    uint8_t                 abPadding2[20+4];
+
+    // host CPU feature 的相關資訊，透過 VM structure 可以看到
+    CPUMFEATURES            HostFeatures;
+    // guest CPU feature 的相關資訊，透過 VM structure 可以看到
+    CPUMFEATURES            GuestFeatures;
+    CPUMINFO                GuestInfo; // guest cpu info
+
+    CPUMCPUID               aGuestCpuIdPatmStd[6]; // 標準的 CPUID leaf set
+    CPUMCPUID               aGuestCpuIdPatmExt[10]; // 擴充的 CPUID leaf set
+    CPUMCPUID               aGuestCpuIdPatmCentaur[4]; // centaur ?
+} CPUM;
+```
+
+
+
+`CPUMDBENTRY` - CPU db 的 entry，大部分資料都與 CPUMFEATURES 相關
+
+```c
+typedef struct CPUMDBENTRY
+{
+    const char     *pszName; // cpu name
+    const char     *pszFullName; // full cpu name
+    uint8_t         enmVendor; // cpu vendor (CPUMCPUVENDOR)
+    uint8_t         uFamily; // cpu family
+    uint8_t         uModel; // cpu model
+    uint8_t         uStepping; // cpu stepping
+    CPUMMICROARCH   enmMicroarch; // microarchitecture
+    uint64_t        uScalableBusFreq;
+    uint32_t        fFlags; // CPUDB_F_XXX
+    uint8_t         cMaxPhysAddrWidth;
+    uint32_t        fMxCsrMask;
+	...
+
+    uint32_t        fMsrMask; // msr mask
+    uint32_t        cMsrRanges; // msr 的 array 大小
+    PCCPUMMSRRANGE  paMsrRanges; // 此 msr 的 array
+} CPUMDBENTRY;
+```
+
+
+
+`CPUMCPUIDCONFIG` - CPUID Configuration (from CFGM)，從 config 讀的 config
+
+```c
+typedef struct CPUMCPUIDCONFIG
+{
+    bool            fNt4LeafLimit;
+    bool            fInvariantTsc;
+    bool            fForceVme;
+    bool            fNestedHWVirt;
+
+    CPUMISAEXTCFG   enmCmpXchg16b;
+	...
+    CPUMISAEXTCFG   enmAmdExtMmx;
+
+    uint32_t        uMaxStdLeaf;
+    uint32_t        uMaxExtLeaf;
+    uint32_t        uMaxCentaurLeaf;
+    uint32_t        uMaxIntelFamilyModelStep;
+    char            szCpuName[128];
+} CPUMCPUIDCONFIG;
+```
+
+
+
+## 10
+
