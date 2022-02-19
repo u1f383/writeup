@@ -320,7 +320,7 @@ $12 = {
   ...
 ```
 
-此時 `buf` 的 0~7 對應到 `Elf64_Dyn->d_tag`，此 member 只有在一開始 dl 時才會用到，因此雖然放了一個不合法的 type `/bin/sh\x00`，不過不會出現問題；`buf` 的 8~f 對應到 `Elf64_Dyn->d_ptr`，存放著指向 string table 的 pointer，因為我們可以控制這塊記憶體的，因此我們也能控制 strtab 的 pointer，讓 `memset()` symbol 對應到的 string 最後能指向我們控制到的 `system` 字串即可。最後 exploit 如下：
+此時 `buf` 的 0 ~ 7 對應到 `Elf64_Dyn->d_tag`，此 member 只有在一開始 dl 時才會用到，因此雖然放了一個不合法的 type `/bin/sh\x00`，不過不會出現問題；`buf` 的 8 ~ f 對應到 `Elf64_Dyn->d_ptr`，存放著指向 string table 的 pointer，因為我們可以控制這塊記憶體的，因此我們也能控制 strtab 的 pointer，讓 `memset()` symbol 對應到的 string 最後能指向我們控制到的 `system` 字串即可。最後 exploit 如下：
 
 ```python
 #!/usr/bin/python3
